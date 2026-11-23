@@ -35,6 +35,20 @@ impl Home {
     pub fn log(&self) -> PathBuf {
         self.dir.join("tcasd.log")
     }
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.dir.join("sessions")
+    }
+    /// Exists while tcasd has a record of the session, so `tcas hook` keeps
+    /// reporting a session whose directory is outside every workspace.
+    pub fn session_marker(&self, sid: &str) -> PathBuf {
+        let name: String =
+            sid.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect();
+        let name = if name.starts_with('.') { format!("_{name}") } else { name };
+        self.sessions_dir().join(name)
+    }
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.dir.join("plugins")
+    }
 
     /// Creates the directory with mode 0700.
     pub fn ensure(&self) -> std::io::Result<()> {

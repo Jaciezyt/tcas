@@ -193,6 +193,7 @@ pub fn harness_of(id: &str) -> String {
 /// readopts its orphaned leases (leases.md section 6, invariant 6).
 pub fn identify(
     c: &Connection,
+    home: &Home,
     session: Option<&str>,
     ancestors: &[tcas_core::proto::ProcId],
     cwd: &str,
@@ -201,14 +202,22 @@ pub fn identify(
     let sid = match session.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => Some(s.to_string()),
         None => {
+            // The newest live session of the nearest registered ancestor
+            // (after /clear the process also has the ended session before it).
             let mut found = None;
             if !ancestors.is_empty() {
-                for s in store::sessions(c)? {
-                    if let (Some(pid), Some(st)) = (s.pid, s.pid_started_at)
-                        && ancestors.iter().any(|a| a.pid == pid && (a.started_at - st).abs() <= 1)
-                    {
-                        found = Some(s.id.clone());
-                        break;
+                let mut all = store::sessions(c)?;
+                // Live ones first, newest first.
+                all.sort_by_key(|s| (s.state == "ended", -s.started_at));
+                'outer: for a in ancestors {
+                    for s in &all {
+                        if let (Some(pid), Some(st)) = (s.pid, s.pid_started_at)
+                            && a.pid == pid
+                            && (a.started_at - st).abs() <= 1
+                        {
+                            found = Some(s.id.clone());
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -216,42 +225,94 @@ pub fn identify(
         }
     };
     let Some(sid) = sid else { return Ok(Caller::User) };
-    if sid.len() > 200 || sid.chars().any(char::is_control) {
+    seen(c, home, &sid, &Seen { cwd: Some(cwd), pid: None, create: true, activate: true, via: "cli" }, now)?;
+    Ok(Caller::Session(sid))
+}
+
+/// What a request tells about its session.
+pub struct Seen<'a> {
+    /// The session's working directory (not updated from subagents).
+    pub cwd: Option<&'a str>,
+    /// The harness process, from hooks.
+    pub pid: Option<tcas_core::proto::ProcId>,
+    /// Create the record if there is none.
+    pub create: bool,
+    /// Bring the session back to `active` (and an ended one back to life).
+    /// `false` only updates the time it was last seen.
+    pub activate: bool,
+    /// `cli` or `hook`, for the event.
+    pub via: &'a str,
+}
+
+/// Records that a session was seen: creates it, or brings it back to
+/// `active` and readopts its orphaned leases (leases.md section 6,
+/// invariant 6). Returns the record, or `None` when it does not exist and
+/// `create` is false.
+pub fn seen(c: &Connection, home: &Home, sid: &str, s: &Seen, now: i64) -> R<Option<store::SessionRow>> {
+    if sid.is_empty() || sid.len() > 200 || sid.chars().any(char::is_control) {
         return Err(Fail::bad("the session ID is not valid"));
     }
-    match store::session(c, &sid)? {
+    let (pid, pid_at) = match s.pid {
+        Some(p) => (Some(p.pid), Some(p.started_at)),
+        None => (None, None),
+    };
+    match store::session(c, sid)? {
+        None if !s.create => return Ok(None),
         None => {
             c.execute(
-                "INSERT INTO session(id, harness, state, cwd, started_at, last_seen_at) VALUES(?1,?2,'active',?3,?4,?4)",
-                rusqlite::params![sid, harness_of(&sid), cwd, now],
+                "INSERT INTO session(id, harness, state, pid, pid_started_at, cwd, started_at, last_seen_at) \
+                 VALUES(?1,?2,'active',?3,?4,?5,?6,?6)",
+                rusqlite::params![sid, harness_of(sid), pid, pid_at, s.cwd, now],
             )?;
-            store::event(c, now, None, Some(&sid), "session.started", json!({ "cwd": cwd, "via": "cli" }))?;
+            store::event(c, now, None, Some(sid), "session.started", json!({ "cwd": s.cwd, "via": s.via }))?;
+            mark(home, sid);
+        }
+        Some(_) if !s.activate => {
+            c.execute(
+                "UPDATE session SET last_seen_at=?2, pid=COALESCE(?3, pid), pid_started_at=COALESCE(?4, pid_started_at) WHERE id=?1",
+                rusqlite::params![sid, now, pid, pid_at],
+            )?;
         }
         Some(row) => {
             c.execute(
-                "UPDATE session SET state='active', ended_at=NULL, last_seen_at=?2, cwd=?3 WHERE id=?1",
-                rusqlite::params![sid, now, cwd],
+                "UPDATE session SET state='active', ended_at=NULL, last_seen_at=?2, cwd=COALESCE(?3, cwd), \
+                 pid=COALESCE(?4, pid), pid_started_at=COALESCE(?5, pid_started_at) WHERE id=?1",
+                rusqlite::params![sid, now, s.cwd, pid, pid_at],
             )?;
             if row.state == "ended" {
-                store::event(c, now, None, Some(&sid), "session.resumed", json!({ "cwd": cwd }))?;
-                for l in store::leases_session(c, &sid)? {
-                    if l.state == tcas_core::lease::LeaseState::Orphaned {
-                        c.execute(
-                            "UPDATE lease SET state='active' WHERE workspace=?1 AND root=?2 AND path_key=?3",
-                            rusqlite::params![l.workspace, l.root, l.path_key],
-                        )?;
-                        store::event(
-                            c,
-                            now,
-                            Some(&l.workspace),
-                            Some(&sid),
-                            "lease.readopted",
-                            json!({ "root": l.root, "path": l.path }),
-                        )?;
-                    }
-                }
+                store::event(c, now, None, Some(sid), "session.resumed", json!({ "cwd": s.cwd, "via": s.via }))?;
+                readopt(c, sid, now)?;
+                mark(home, sid);
             }
         }
     }
-    Ok(Caller::Session(sid))
+    Ok(store::session(c, sid)?)
+}
+
+/// Orphaned leases of a session that is back become active again.
+pub fn readopt(c: &Connection, sid: &str, now: i64) -> R<()> {
+    for l in store::leases_session(c, sid)? {
+        if l.state == tcas_core::lease::LeaseState::Orphaned {
+            c.execute(
+                "UPDATE lease SET state='active' WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                rusqlite::params![l.workspace, l.root, l.path_key],
+            )?;
+            store::event(c, now, Some(&l.workspace), Some(sid), "lease.readopted", json!({ "root": l.root, "path": l.path }))?;
+        }
+    }
+    Ok(())
+}
+
+/// The marker `tcas hook` looks for to keep reporting a session whose
+/// directory is outside every workspace (harness.md section 3).
+pub fn mark(home: &Home, sid: &str) {
+    let p = home.session_marker(sid);
+    if !p.exists() {
+        let _ = std::fs::create_dir_all(home.sessions_dir());
+        let _ = std::fs::write(&p, "");
+    }
+}
+
+pub fn unmark(home: &Home, sid: &str) {
+    let _ = std::fs::remove_file(home.session_marker(sid));
 }

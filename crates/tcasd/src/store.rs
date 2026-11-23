@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS interest(
 CREATE TABLE IF NOT EXISTS unattributed(
   workspace TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, seen_at INTEGER NOT NULL,
   PRIMARY KEY(workspace, root, path));
+CREATE TABLE IF NOT EXISTS outside_edit(
+  workspace TEXT NOT NULL, path TEXT NOT NULL, session TEXT NOT NULL, edits INTEGER NOT NULL,
+  first_at INTEGER NOT NULL, last_at INTEGER NOT NULL,
+  PRIMARY KEY(workspace, path, session));
 CREATE TABLE IF NOT EXISTS event(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, workspace TEXT, session TEXT,
   agent TEXT, type TEXT NOT NULL, payload TEXT NOT NULL);

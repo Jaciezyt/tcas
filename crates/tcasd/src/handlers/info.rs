@@ -88,8 +88,35 @@ pub fn status(env: &mut Env, req: &Request) -> R<Value> {
         unattributed: unattributed(env, &ws, &leases),
         leases: lviews,
         released,
+        outside: outside(env, &ws)?,
     };
     Ok(serde_json::to_value(res).unwrap())
+}
+
+/// Checkouts outside every workspace that sessions here edited, still
+/// outside (leases.md section 3).
+fn outside(env: &Env, ws: &Ws) -> R<Vec<tcas_core::proto::OutsideEdit>> {
+    let mut st = env.c.prepare(
+        "SELECT path, SUM(edits), GROUP_CONCAT(session, ' '), MAX(last_at) FROM outside_edit WHERE workspace=?1 \
+         GROUP BY path ORDER BY MAX(last_at) DESC",
+    )?;
+    let rows = st.query_map([&ws.row.id], |r| {
+        let sessions: String = r.get(2)?;
+        Ok(tcas_core::proto::OutsideEdit {
+            path: r.get(0)?,
+            edits: r.get::<_, i64>(1)? as u64,
+            sessions: sessions.split(' ').map(str::to_string).collect(),
+            last_at: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for o in rows {
+        let o = o?;
+        if env.world.root_of(&o.path).is_none() && Path::new(&o.path).is_dir() {
+            out.push(o);
+        }
+    }
+    Ok(out)
 }
 
 fn session_view(env: &Env, s: &store::SessionRow, lviews: &[tcas_core::proto::LeaseView]) -> SessionView {

@@ -1,7 +1,9 @@
 //! The `tcas` command (daemon-and-cli.md section 5).
 
 mod client;
+mod hook;
 mod out;
+mod plugin;
 
 use std::time::Duration;
 
@@ -66,6 +68,19 @@ enum Cmd {
     Daemon(DaemonCmd),
     /// Who tcasd takes this command to come from.
     Whoami,
+    /// Harness plugins.
+    #[command(subcommand)]
+    Plugin(PluginCmd),
+    /// Called by a harness hook with the event on stdin.
+    #[command(hide = true)]
+    Hook { harness: String },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Print the plugin directory for a harness (writing it if needed), for
+    /// `claude --plugin-dir`.
+    Path { harness: String },
 }
 
 #[derive(Subcommand)]
@@ -268,12 +283,17 @@ impl Ctx {
 
 fn main() {
     let cli = Cli::parse();
-    if let Cmd::Daemon(DaemonCmd::Run) = cli.cmd {
-        if let Err(e) = tcasd::server::run(Home::from_env()) {
-            eprintln!("tcasd: {e}");
-            std::process::exit(1);
+    match &cli.cmd {
+        Cmd::Daemon(DaemonCmd::Run) => {
+            if let Err(e) = tcasd::server::run(Home::from_env()) {
+                eprintln!("tcasd: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        Cmd::Hook { harness } => std::process::exit(hook::run(harness)),
+        Cmd::Plugin(PluginCmd::Path { harness }) => std::process::exit(plugin::path(harness, cli.json)),
+        _ => {}
     }
     let c = Client::from_env();
     let o = Out::new(&c.cwd);
@@ -299,6 +319,7 @@ fn run(x: &Ctx, cmd: Cmd) -> Result<i32, i32> {
             log(x, base, follow)?
         }
         Cmd::Daemon(d) => daemon(x, d)?,
+        Cmd::Hook { .. } | Cmd::Plugin(_) => unreachable!("handled in main"),
         Cmd::Whoami => {
             let v = x.call("whoami", json!({}))?;
             x.emit_plain(v, |v| {

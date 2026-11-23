@@ -1,5 +1,6 @@
 //! Request dispatch. Each request runs in one transaction.
 
+pub mod hook;
 pub mod info;
 pub mod lease;
 pub mod workspace;
@@ -55,6 +56,7 @@ pub fn dispatch(d: &'static Daemon, req: Request, stream: &UnixStream) -> Respon
                 "log" => info::log(env, &req),
                 "daemon.status" => info::daemon_status(env),
                 "whoami" => Ok(json!({ "caller": env.caller.label(), "user": env.caller.is_user() })),
+                "hook" => hook::handle(env, &req),
                 other => Err(Fail::bad(format!("unknown operation {other:?}"))),
             })
         }
@@ -92,7 +94,7 @@ pub fn with_tx_inner<T>(
     let tx = conn.transaction()?;
     let now = tcas_sys::clock::now_ms();
     let cwd = canonical_cwd(&req.cwd);
-    let caller = identify(&tx, req.session.as_deref(), &req.ancestors, &cwd.to_string_lossy(), now)?;
+    let caller = identify(&tx, &d.home, req.session.as_deref(), &req.ancestors, &cwd.to_string_lossy(), now)?;
     let world = World::load(&tx)?;
     let mut env = Env { d, c: &tx, world, g, now, caller, cwd, waiting };
     let changed = housekeeping(&mut env)?;

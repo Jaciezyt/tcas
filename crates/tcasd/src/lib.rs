@@ -9,6 +9,7 @@ pub mod liveness;
 pub mod repos;
 pub mod server;
 pub mod store;
+pub mod text;
 pub mod waits;
 pub mod world;
 pub mod wsjson;

@@ -342,6 +342,9 @@ pub struct StatusResult {
     /// Orphaned leases released because their files were clean.
     #[serde(default)]
     pub released: Vec<PathRef>,
+    /// Checkouts outside every workspace that sessions here edited.
+    #[serde(default)]
+    pub outside: Vec<OutsideEdit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,4 +398,101 @@ pub struct ExemptView {
     pub path: String,
     pub written: String,
     pub source: String,
+}
+
+/// A checkout outside every workspace that sessions in a workspace edited
+/// (leases.md section 3, "改到了 workspace 外面").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutsideEdit {
+    pub path: String,
+    pub edits: u64,
+    pub sessions: Vec<String>,
+    pub last_at: i64,
+}
+
+// ---------------------------------------------------------------------------
+// The `hook` operation (daemon-and-cli.md section 4)
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookTool {
+    /// `edit`, `bash`, `read`, `other`.
+    pub kind: String,
+    pub call_id: String,
+    /// The harness's own name for the tool, for messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// edit, read: absolute paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_id: Option<String>,
+    #[serde(default)]
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookRequest {
+    pub harness: String,
+    /// `session_start`, `prompt`, `pre_tool`, `post_tool`, `stop`, `agent_stop`, `session_end`.
+    pub event: String,
+    /// The harness's own session ID; tcas's is `<harness>:<session>`.
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub cwd: String,
+    /// The harness process.
+    #[serde(default)]
+    pub pid: i32,
+    #[serde(default)]
+    pub pid_started_at: i64,
+    /// session_start: `startup`, `resume`, `clear`, `compact`. session_end: the harness's reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<HookTool>,
+    /// stop: background commands still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_running: Option<Vec<String>>,
+}
+
+impl HookRequest {
+    pub fn session_id(&self) -> String {
+        format!("{}:{}", self.harness, self.session)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookResponse {
+    /// `deny` or `allow`; `allow` only for tcas commands (harness.md section 5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    /// pre_tool: run this call in the background (tcas lease wait).
+    #[serde(default)]
+    pub background: bool,
+    /// The wait command for a denial; the adapter adds how to run it asynchronously.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_command: Option<String>,
+    /// The wait command covers more than one path.
+    #[serde(default)]
+    pub wait_many: bool,
+    /// The path stays leased until the user acts (orphaned or stalled).
+    #[serde(default)]
+    pub needs_user: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Text for the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// session_start: variables for the session's environment.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }

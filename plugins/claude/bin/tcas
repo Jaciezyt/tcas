@@ -1,0 +1,50 @@
+#!/bin/sh
+# Forwards to the installed tcas (harness.md section 1). This directory is on
+# the Bash tool's PATH, so agents run `tcas …` through here, and every hook
+# calls `bin/tcas hook claude`.
+
+# Filled in by `tcas plugin path` with the program that wrote this copy.
+TCAS_BUILT=""
+
+if [ "$1" = "hook" ] && [ -n "$TCAS_DISABLE" ]; then
+  exit 0
+fi
+
+here=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)
+tcas_home=${TCAS_HOME:-$HOME/.tcas}
+
+for c in "$TCAS_BIN" "$tcas_home/bin/tcas" "$TCAS_BUILT"; do
+  if [ -n "$c" ] && [ -x "$c" ]; then
+    exec "$c" "$@"
+  fi
+done
+
+# On PATH, skipping this directory.
+old_ifs=$IFS
+IFS=:
+for d in $PATH; do
+  [ -n "$d" ] || continue
+  real=$(cd "$d" 2>/dev/null && pwd -P) || continue
+  [ "$real" = "$here" ] && continue
+  if [ -x "$d/tcas" ] && [ ! -d "$d/tcas" ]; then
+    IFS=$old_ifs
+    exec "$d/tcas" "$@"
+  fi
+done
+IFS=$old_ifs
+
+# No tcas program. With no workspace there is nothing to protect; otherwise
+# edits and Bash commands are refused, since nothing can check them.
+if [ "$1" = "hook" ]; then
+  input=$(cat)
+  ws="$tcas_home/workspaces.json"
+  if [ ! -s "$ws" ] || grep -q '"workspaces": *\[ *\]' "$ws"; then
+    exit 0
+  fi
+  if printf '%s' "$input" | grep -q '"hook_event_name" *: *"PreToolUse"'; then
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"tcas: the tcas program is not installed (looked for $TCAS_BIN, ~/.tcas/bin/tcas and tcas on PATH), so changes in TCAS workspaces are refused. Tell the user."}}'
+  fi
+  exit 0
+fi
+echo "tcas: the tcas program is not installed (looked for \$TCAS_BIN, $tcas_home/bin/tcas and tcas on PATH)" >&2
+exit 127

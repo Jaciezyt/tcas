@@ -495,8 +495,10 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
         return Ok(acq);
     }
 
+    let brief = req.brief.as_deref().and_then(|b| brief::sanitize(b, ws.cfg.brief.max_chars));
+
     // Granted: yields first, then the new leases.
-    let mut yielded_to_notify: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut yielded_to_notify: BTreeMap<String, Vec<(String, &str)>> = BTreeMap::new();
     for &(i, why) in &d.yielded {
         if d.housekeeping.contains(&i) {
             continue;
@@ -504,19 +506,30 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
         let l = &leases[i];
         // A yielded directory leaves the dirty files below it with their
         // holder: they have file leases of their own (leases.md section 6).
-        release(env, l, yield_reason(why), Some(req.session))?;
-        yielded_to_notify.entry(l.session.clone()).or_default().push(ws.display(&l.root, &l.path, l.is_prefix));
+        let reason = yield_reason(why);
+        release(env, l, reason, Some(req.session))?;
+        // The holder is told when it may still count on the lease: one it
+        // requested or waited for (harness.md section 6). An implicit lease
+        // follows the file and is taken again by the next edit.
+        let alive = ctx.sessions.get(&l.session).is_some_and(|s| s.state != "ended");
+        if alive && matches!(why, Why::Expired | Why::Committed) {
+            yielded_to_notify.entry(l.session.clone()).or_default().push((ws.display(&l.root, &l.path, l.is_prefix), reason));
+        }
     }
-    for (holder, paths) in yielded_to_notify {
+    let to_brief = brief.clone().or_else(|| ctx.sessions.get(req.session).and_then(|s| s.brief.clone()));
+    for (holder, items) in yielded_to_notify {
         let kept: Vec<String> = store::leases_session(env.c, &holder)?
             .iter()
             .filter(|l| l.workspace == ws_id)
             .map(|l| ws.display(&l.root, &l.path, l.is_prefix))
             .collect();
-        env.notice(&holder, "lease.yielded", json!({ "workspace": ws_id, "paths": paths, "to": req.session, "still_held": kept }))?;
+        let (paths, why): (Vec<String>, Vec<&str>) = items.into_iter().unzip();
+        env.notice(
+            &holder,
+            "lease.yielded",
+            json!({ "workspace": ws_id, "paths": paths, "why": why, "to": req.session, "to_brief": to_brief, "still_held": kept }),
+        )?;
     }
-
-    let brief = req.brief.as_deref().and_then(|b| brief::sanitize(b, ws.cfg.brief.max_chars));
     let mut new_files: Vec<(usize, LeaseRow)> = Vec::new();
     for (wi, (r, m)) in managed.iter().enumerate() {
         let pr = ws.path_ref(&m.root, &m.rel, r.is_dir);

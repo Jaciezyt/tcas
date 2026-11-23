@@ -1,0 +1,5 @@
+{
+  "name": "tcas",
+  "version": "0.1.0",
+  "description": "Leases on files and directories, so several Claude Code sessions can share a checkout without overwriting each other's work."
+}

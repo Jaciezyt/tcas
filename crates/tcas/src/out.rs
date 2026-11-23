@@ -658,6 +658,23 @@ pub fn status(o: &Out, s: &StatusResult) -> i32 {
         println!();
         println!("released (orphaned, now clean): {}", join_displays(&s.released));
     }
+    if !s.outside.is_empty() {
+        println!();
+        println!("edited outside this workspace (not coordinated):");
+        let shown: Vec<String> =
+            s.outside.iter().map(|x| pathfmt::for_viewer(&o.cwd, Path::new(&x.path), o.home.as_deref(), false)).collect();
+        let w = width(shown.iter().map(String::as_str), 16);
+        for (x, p) in s.outside.iter().zip(&shown) {
+            let who: Vec<String> = x.sessions.iter().map(|s| short_session(s)).collect();
+            println!(
+                "  {}{}{}→  tcas workspace add {}",
+                pad(p, w),
+                pad(&human::count(x.edits as usize, "edit", "edits"), 10),
+                pad(&who.join(", "), 16),
+                shell_quote(p)
+            );
+        }
+    }
     0
 }
 

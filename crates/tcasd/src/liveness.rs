@@ -39,11 +39,17 @@ pub fn check(d: &'static Daemon) {
     let now = tcas_sys::clock::now_ms();
     let retention = d.global().cfg.daemon.event_retention_days as i64 * 86_400_000;
     let conn = d.db();
-    let _ = conn.execute(
-        "DELETE FROM session WHERE state='ended' AND ended_at < ?1 AND id NOT IN (SELECT session FROM lease)",
-        [now - ENDED_RETENTION_MS],
-    );
+    let old: Vec<String> = conn
+        .prepare("SELECT id FROM session WHERE state='ended' AND ended_at < ?1 AND id NOT IN (SELECT session FROM lease)")
+        .and_then(|mut st| st.query_map([now - ENDED_RETENTION_MS], |r| r.get(0))?.collect())
+        .unwrap_or_default();
+    for id in &old {
+        if conn.execute("DELETE FROM session WHERE id=?1", [id]).is_ok() {
+            crate::daemon::unmark(&d.home, id);
+        }
+    }
     let _ = conn.execute("DELETE FROM notice WHERE session NOT IN (SELECT id FROM session)", []);
+    let _ = conn.execute("DELETE FROM outside_edit WHERE session NOT IN (SELECT id FROM session)", []);
     if retention > 0 {
         let _ = conn.execute("DELETE FROM event WHERE at < ?1", [now - retention]);
     }
