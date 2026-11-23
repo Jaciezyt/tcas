@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/tcas-core", "crates/tcas-sys", "crates/tcasd", "crates/tcas"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+tcas-core = { path = "crates/tcas-core" }
+tcas-sys = { path = "crates/tcas-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
