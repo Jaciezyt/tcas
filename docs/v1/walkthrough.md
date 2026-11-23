@@ -59,7 +59,7 @@ opened ~/Code/app (mode auto), 2 repositories:
 |---|---|
 | `tcas` 命令行 | 连不上 tcasd，先把它启动起来 |
 | tcasd | 登记 `~/Code/app`；发现 `api/`、`web/` 两个仓库，记下各自的分支；更新 `~/.tcas/workspaces.json` |
-| `tcas` 命令行 | 试一次本机的 git 是否支持配置式钩子，然后在两个仓库的 `.git/config` 里各加一行引用，装上 git 钩子 |
+| tcasd | 试一次本机的 git 是否支持配置式钩子，然后在两个仓库的 `.git/config` 里各加一行引用，装上 git 钩子 |
 
 Claude Code 的 plugin 之前已经装好（`tcas plugin install claude`）。想让会话不经询问就能提交，要事先在 Claude Code 的权限设置里放行 `tcas commit`。
 
@@ -68,7 +68,7 @@ Claude Code 的 plugin 之前已经装好（`tcas plugin install claude`）。�
 | 介入点 | tcas 做什么 |
 |---|---|
 | hook `SessionStart` | 把 `TCAS_SESSION` 写进会话的环境；向 tcasd 登记会话，带上 harness 进程的 PID 和启动时间；注入一段说明：这个目录由 TCAS 管理、有 `api/` 和 `web/` 两个仓库、三条用法、别的会话现在持有什么（此时没有） |
-| hook `UserPromptSubmit` | 用户发出第一条消息时，取前 80 个字符作会话的标题，之后出现在别人收到的拒绝理由里 |
+| hook `UserPromptSubmit` | 用户发出第一条消息时，取前 80 个字符作会话的标题。标题只出现在给用户看的地方（`tcas status`、用户自己的 git 操作被拒时），别的会话看不到 |
 
 ### 步骤 3（09:02）：A 先申请再动手
 
@@ -270,7 +270,7 @@ released: 3 file leases.  still held: api/src/auth/ (directory), web/src/api/cli
 + B  web/src/api/client.ts        文件  wait
 ```
 
-A 还持有 `api/src/auth/`，并且在等 `api/src/routes/export.ts`。B 在 A 开始等的时候收到通知，知道 A 在等这个文件。A 要是没有运行那条 `release`，B 会多等 30 分钟，见第 6 节。
+A 还持有 `api/src/auth/`，并且在等 `api/src/routes/export.ts`。B 在 A 开始等的时候收到通知，知道 A 在等这个文件。A 要是没有运行那条 `release`，B 也只多等到 A 这一轮结束：`client.ts` 是 A 事先申请、已经提交的，A 的 `Stop` 一到就让给 B，A 下一轮开始时被告知（[leases.md](leases.md) 第 6 节「提交过的显式租约」）。
 
 ### 步骤 11（09:25）：用户自己提交，被 git 钩子拦下
 
@@ -464,12 +464,12 @@ A 重读 `export.ts`，改完，跑测试，提交，释放。用户退出两个
 
 ## 6. 这次过程里能看到的问题
 
-**提交之后，事先申请的租约要靠 agent 自己放。** 步骤 10 和 14 里，A 和 B 提交后都按输出里的提示运行了 `tcas lease release`，等着的一方才当场拿到。agent 没有这样做时：
+**提交之后忘了放事先申请的租约。** 步骤 10 和 14 里，A 和 B 提交后都按输出里的提示运行了 `tcas lease release`，等着的一方当场拿到。agent 没有这样做时，按「提交过的显式租约」的规则（[leases.md](leases.md) 第 6 节），持有者这一轮还在进行就保留，这一轮结束、有人在等就让出：
 
-- 步骤 10 里，A 最后一次用到 `client.ts` 是 09:22 的提交，要到 09:52 才能让出。B 的等待在 09:45 先超时一次，再等一次，09:52 才拿到，比现在晚 30 分钟。
-- 步骤 14 里 A 也要多等 30 分钟。
+- 步骤 10 里，A 在 09:22 提交后去等 `export.ts`、结束这一轮。`Stop` 一到，`client.ts` 让给 B，和运行了 `release` 只差几秒。A 下一轮（09:40 被唤醒时）先被告知 `client.ts` 已经给了 B。
+- 步骤 14 里，B 提交后要是接着做别的、没有结束这一轮，A 要等到 B 这一轮结束。这段时间 B 还在工作，可能还要改这个目录，所以保留是有意的。
 
-有人开始等时持有者会收到通知（步骤 8），所以它知道该放；但放不放仍然看它自己。还没有定的是另一半：提交过之后，事先申请的租约要不要和自动取得的一样，别人来要、文件干净就让。
+这条规则是 2026-11-23 定的。之前的版本里，持有者不放就要多等 30 分钟。
 
 **提交之间，主线可能暂时不自洽。** 步骤 10 之后，`api/` 的 `HEAD` 里已经没有 `readCookie`，而 `export.ts` 里对应的改名还在 B 手里没提交，直到步骤 14。第一版不管提交的先后和验证（design.md 第 7 节）。
 

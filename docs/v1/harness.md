@@ -70,7 +70,7 @@ plugins/claude/
 | `PostToolUse` | `Bash` | 关闭窗口并对账；投递通知 | 否 | 10 秒 |
 | `PostToolUse` | `Read\|Grep` | 读取提示（只对 `Read`）；读到或搜到自己持有的路径时更新它的使用时间（[leases.md](leases.md) 第 6 节）；投递通知 | 否 | 3 秒 |
 | `PostToolUseFailure` | `Edit\|Write\|NotebookEdit\|Bash` | 同对应的 `PostToolUse` | 否 | 10 秒 |
-| `Stop` | 无 | 关闭主 agent 所有还开着的调用；更新后台命令的窗口；会话变为 `idle` | 否 | 5 秒 |
+| `Stop` | 无 | 关闭主 agent 所有还开着的调用；更新后台命令的窗口；会话变为 `idle`；重新判定在等它提交过的显式租约的等待（[leases.md](leases.md) 第 6 节） | 否 | 5 秒 |
 | `SubagentStop` | 无 | 关闭这个子 agent 所有还开着的调用 | 否 | 5 秒 |
 | `SessionEnd` | 无 | 会话结束（[leases.md](leases.md) 第 6 节） | 否 | 5 秒 |
 
@@ -86,7 +86,7 @@ plugins/claude/
 
 `PreToolUse` 收到 `tool_input.file_path`，是解析过符号链接的绝对路径（实测）。流程：
 
-1. 路径在豁免目录里（临时目录、harness 自己的目录、用户配的）：放行，不连 tcasd。唯一的例外是 `~/.tcas`：会话改这里的文件一律拒绝，理由里说明 tcas 的配置和数据只有用户能改。
+1. 路径在豁免目录里（临时目录、harness 自己的目录、用户配的）：放行，不连 tcasd。唯一的例外是 `~/.tcas`：会话改这里的文件一律拒绝，理由里说明 tcas 的配置和数据只有用户能改。workspace 里的 `.tcas.toml` 同样拒绝（在第 3 步之前判断，不看租约），理由相同。
 2. 路径不在任何 workspace 的根里：放行。会话的当前目录在某个 workspace 里、而这条路径在外面的一个 git 检出里时，放行之后另外报给 tcasd 记一笔，用来提示（[leases.md](leases.md) 第 3 节）；其余情况不连 tcasd。
 3. 向 tcasd 申请这条路径（[leases.md](leases.md) 第 5 节）。路径在所属的检出里被 git 排除时，tcasd 直接答复放行，不记租约；这一步要问 git，所以在 tcasd 里做，结果有缓存。`auto` 模式下没人持有就自动授予。路径在本会话自己的目录租约之下时直接通过，同时给这个文件记一条文件租约。
 4. 通过：记下一次进行中的编辑调用（会话、`agent_id`、`tool_use_id`、路径），不输出任何内容，退出码 0。权限照常由 harness 自己的流程决定，hook 不代为批准。
@@ -152,6 +152,8 @@ Bash 写文件拦不住。第一版用三层来管：
 
 当前目录从 hook 输入里的 `cwd` 起算，定出目录后按 [leases.md](leases.md) 第 3 节找到仓库。`cwd` 是装着几个仓库的目录、本身不在任何仓库里时，没有先换目录的 git 命令本来就会失败，不拦。
 
+`cwd` 不在任何 workspace 里时，`tcas hook` 先在本地做这一步解析，再决定要不要连 tcasd：命令里 `cd`、`-C` 指到的目录落在某个 workspace 里，照样套护栏、开窗口。例如会话从 workspace 的上级目录启动，运行 `git -C app stash`。
+
 **规则**
 
 | 命令 | 拒绝的条件 | 提示改用 |
@@ -162,7 +164,7 @@ Bash 写文件拦不住。第一版用三层来管：
 | 不带路径的 `git commit`（含 `--amend`） | 暂存区里有不在本会话租约之下的路径 | `tcas commit` |
 | `git commit --no-verify`、`-n` | 总是。它会跳过 git 钩子（5.6） | 去掉这个选项，或 `tcas commit` |
 | 命令里设了 `TCAS_ALLOW` | 总是。它是给用户放行用的（5.6） | 去掉它 |
-| 命令的参数或重定向的目标写明了 `~/.tcas` 里的路径 | 总是，不管有没有别的会话。只读的命令（`cat`、`ls`）除外 | 告诉用户 |
+| 命令的参数或重定向的目标写明了 `~/.tcas` 里的路径，或者 workspace 里的某个 `.tcas.toml` | 总是，不管有没有别的会话。只读的命令（`cat`、`ls`）除外 | 告诉用户 |
 | `git stash`、`git stash push`、`save`、`-u`、`-a` | 总是 | 没有替代，改动留在原处 |
 | `git reset --hard`、`--merge`、`--keep` | 总是 | 对自己持有的具体路径 `git restore <路径>` |
 | `git checkout .`、`git restore .`、`git checkout -- <路径>`、`git restore <路径>` | 路径覆盖了不在本会话租约之下的文件 | 只还原自己持有的路径 |
@@ -190,7 +192,7 @@ Bash 写文件拦不住。第一版用三层来管：
 
 ### 5.2 对账
 
-**打开窗口**（`PreToolUse`，护栏通过之后）：对 hook 输入里 `cwd` 所在的 workspace 拍一次快照并记下窗口（会话、`agent_id`、`tool_use_id`、时间、命令原文）。`cwd` 不在任何 workspace 里就不处理。
+**打开窗口**（`PreToolUse`，护栏通过之后）：对 hook 输入里 `cwd` 所在的 workspace 拍一次快照并记下窗口（会话、`agent_id`、`tool_use_id`、时间、命令原文）。命令里的 `cd`、`-C` 指到别的 workspace，或者会话在别的 workspace 里持有租约时，那些 workspace 也拍。一个都没有就不处理。
 
 窗口按会话的当前目录定，不看命令写到哪里：会话在主目录里运行一条往 `/tmp` 写文件的命令，窗口照常打开，往 `/tmp` 写的东西不在快照里，不会被记成什么。会话的当前目录本身在豁免目录里时不开窗口。
 
@@ -231,7 +233,8 @@ Bash 写文件拦不住。第一版用三层来管：
 - 这类调用的窗口在 `PostToolUse` 时不关，改成按 `backgroundTaskId` 记的后台窗口。
 - `Stop` 的输入里有 `background_tasks`，列出还在运行的后台命令（实测）。后台窗口在 `Stop` 报告它不再运行时关闭并对账，会话结束时也关闭。
 - 后台窗口开着期间，这个会话每次 Bash 调用结束时顺带对账一次。
-- 它开着时，别的会话的对账会把这个会话算作「同时开着 Bash 窗口」，归属不确定的情况会变多。
+- 后台窗口开着的头 60 秒（`[bash] background_window_secs`），它和前台调用一样算「正在进行的调用」：别的会话的对账把这个会话算作「同时开着 Bash 窗口」，它的租约不让出（[leases.md](leases.md) 第 5 节），它不算停滞。
+- **过了 60 秒就不再这样算。** 开发服务器、`--watch` 的测试这类命令会在后台跑上几个小时；一直算的话，这期间所有会话用 Bash 新建、改动的文件都会变成归属不确定，这个会话干净的隐式租约也永远让不出去。之后这条命令的改动照样在这个会话每次 Bash 调用结束时对账；落在别的会话窗口里的，算到那个会话头上，可能算错。这类命令写的多半是被 git 排除的构建产物，不受影响。
 
 ### 5.4 提交
 
@@ -246,11 +249,11 @@ Bash 写文件拦不住。第一版用三层来管：
 Bash 调用的整条命令是一个 `tcas` 命令时（只有一个简单命令，程序名是 `tcas`，没有 `;`、`&&`、管道、重定向和命令替换），`PreToolUse` 的处理不同：
 
 - **不开对账窗口**。`tcas lease wait` 会运行很久，窗口一直开着的话，这期间别的会话用 Bash 做的改动都会变成归属不确定。
-- **直接批准**（`permissionDecision: "allow"`），限于 agent 可用的这些子命令：`lease acquire`、`lease release`、`lease list`、`lease who`、`lease wait`、`status`、`workspace list`。实测：默认权限模式下，不批准时这条命令被 harness 以「需要批准」拒绝，批准后直接运行。
+- **直接批准**（`permissionDecision: "allow"`），限于 agent 可用的这些子命令：`lease acquire`、`lease release`、`lease list`、`lease who`、`lease wait`、`status`、`workspace list`、`session list`、`exempt list`、`log`、`stats`、`doctor`。实测：默认权限模式下，不批准时这条命令被 harness 以「需要批准」拒绝，批准后直接运行。
 - **`tcas lease wait` 只在后台运行**。这次调用没有设 `run_in_background` 时，hook 在批准的同时用 `updatedInput` 把它改成后台运行。实测：改写后工具调用 0.2 秒就返回，命令 3 秒后才结束，这一轮没有被它占住，命令结束时会话被唤醒。
 - `tcas lease wait` 出现在一条复合命令里（如 `tcas lease wait x && …`），又不是后台运行时，hook 改写不了，就拒绝这次调用，让 agent 把它单独作为一条后台命令运行。
 - `tcas commit` 不自动批准。它会运行 git 的提交钩子，权限照常由 harness 决定。
-- `tcas workspace open` 和 `tcas workspace close` 也不自动批准。它们影响这个目录里所有的会话和用户自己的 git 操作，放不放行由 harness 的权限规则决定。
+- `tcas workspace open`、`add`、`remove`、`close` 也不自动批准。它们影响这些目录里所有的会话和用户自己的 git 操作，放不放行由 harness 的权限规则决定。
 - `.tcas.toml` 里 `[bash] approve_tcas = false` 可以关掉自动批准。
 
 ### 5.6 git 钩子
@@ -298,7 +301,7 @@ git 可以在配置里定义钩子（`hook.<名字>.event` 和 `hook.<名字>.co
 
 **提交（`pre-commit`）**
 
-钩子拿到这次要提交的路径（`git diff --cached --name-only`），连同会话身份（环境变量，没有就是用户）问 tcasd：
+钩子拿到这次要提交的路径（`git diff --cached --name-only`），连同会话身份（按第 2 节的认法：环境变量，加上祖先进程；都没有才是用户）问 tcasd。只看环境变量的话，agent 用 `env -u` 清掉变量再提交，就会被当成用户，遗留租约的文件和 `TCAS_ALLOW` 都对它放行。这条 `git diff` 必须在钩子自己的环境里运行：`git commit --only` 时 git 用一个临时索引，通过 `GIT_INDEX_FILE` 传给钩子（实测：带着它看到的是 `a.txt`，去掉它看到的是别人暂存的 `b.txt`）。反过来，钩子不把这些变量带给 tcasd（[daemon-and-cli.md](daemon-and-cli.md) 第 2 节）。
 
 | 这次提交里的路径 | 发起的是会话 | 发起的是用户 |
 |---|---|---|
@@ -311,7 +314,7 @@ git 可以在配置里定义钩子（`hook.<名字>.event` 和 `hook.<名字>.co
 
 遗留租约对用户放行，是因为把结束了的会话留下的改动提交掉，正是清除遗留租约的办法（[leases.md](leases.md) 第 6 节）。
 
-拒绝时的输出（路径相对仓库根，和 git 自己的输出一致）：
+拒绝时的输出（路径相对仓库根，和 git 自己的输出一致）。持有者后面的引号里，发起的是用户时是那个会话的标题，是会话时是持有者的 brief（[leases.md](leases.md) 第 5 节「brief」）：
 
 ```
 tcas: commit refused. It includes files that other sessions are still working on:
@@ -338,7 +341,8 @@ To commit them anyway:        TCAS_ALLOW=1 git commit …      (git commit --no-
 `git stash` 没有专门的钩子，但它要先更新 `refs/stash`，这一步会触发 `reference-transaction`。实测在这里拒绝时 stash 整个不发生：工作目录没有被还原，新建的未跟踪文件也还在。
 
 - 只拦保存：`refs/stash` 的新值不为空，且不在 stash 已有的记录里（`git rev-list -g refs/stash`）。`pop`、`drop`、`apply` 不拦（实测）。这时才问 tcasd 仓库里有没有别的会话持有租约。
-- 这个钩子在每次引用更新时都会触发，所以对 `refs/stash` 以外的引用立即退出，不连 tcasd。
+- 只在 `prepared` 阶段判断。一次引用更新会按阶段触发好几次（实测 `git stash`：`refs/stash` 依次是 `preparing`、`prepared`、`committed`，`pop` 时还有一次 `aborted`），阶段是钩子的第一个参数。在 `prepared` 拒绝时 `git stash -u` 以 128 退出，改动和未跟踪文件都在原处（实测）。
+- 这个钩子在每次引用更新时都会触发，所以对别的阶段和 `refs/stash` 以外的引用立即退出，不连 tcasd。
 - stash 的列表是整个仓库共用的，各个 worktree 都看得到。钩子按发起 `git stash` 的那个检出判断（实测：钩子的当前目录是那个 worktree），别的 worktree 里有没有人工作不影响。
 - 开销（实测，钩子用的是空命令）：重放 30 个提交的变基，挂着它约 940 毫秒，不挂约 150 毫秒，每重放一个提交多出约 26 毫秒；单次提交看不出差别。可以在 `.tcas.toml` 里单独关掉。
 
@@ -366,7 +370,7 @@ To commit them anyway:        TCAS_ALLOW=1 git commit …      (git commit --no-
 - 别的会话现在各自在做什么（brief）、持有哪些路径，带仓库所在的目录。没写过 brief 的只列路径。
 - 本会话持有哪些路径（续接、压缩之后）。压缩之后（`source` 为 `compact`）重新注入一次，因为之前的提示已经不在上下文里。
 
-workspace 是在会话启动之后才打开的时候（用户打开的，或别的会话打开的），这个会话没有收到过上面的内容。tcas 在它之后第一个能注入内容的 hook 里补上，并说明这个目录刚刚开始由 TCAS 管理。
+两种情况下会话没有收到过上面的内容：workspace 是在会话启动之后才打开的（用户打开的，或别的会话打开的）；会话从 workspace 外面启动，后来才改到里面的文件。tcas 在它第一次碰到这个 workspace 之后、第一个能注入内容的 hook 里补上，前一种情况另外说明这个目录刚刚开始由 TCAS 管理。
 
 三条用法的原文（`auto` 模式）：
 
@@ -403,7 +407,7 @@ shows up now rather than halfway through:
 ```
 
 - 命令里的目录取这几个文件最近的共同上级目录。它是某个根目录本身，或者超过了目录大小的限制时，不给现成的命令，只说明用法。三个文件分属几个仓库或几个根时，命令里每个仓库各给一个目录。
-- 每个会话只提醒一次。`.tcas.toml` 里 `hint_after_files = 0` 可以关掉。
+- 每个会话只提醒一次。`.tcas.toml` 里 `[brief] hint_after_files = 0` 可以关掉。
 - 改一个提交一个的会话不会触发：提交后隐式租约就释放了，凑不到三条。
 
 **改到 workspace 外面的提示**（`PostToolUse`，编辑工具）：会话的当前目录在 workspace 里，改的文件在外面的一个 git 检出里。每个（会话，检出）一次。
@@ -426,12 +430,21 @@ not coordinated with other sessions. If you will keep working there, add it to t
 | 别的会话事先申请了一片范围，带着它的 brief | 这个 workspace 里其他活着的会话，各一次 |
 | 有会话开始等你持有的路径，带着它的 brief | 持有者 |
 | 等待的结果：授予、超时、死锁 | 等待的会话 |
-| 你的一条租约因为长时间没用到，让给了别的会话；再改这个文件前要重新取得租约并重读 | 原持有者 |
+| 你的一条租约让给了别的会话（长时间没用到，或者你提交过它、这一轮结束之后有人来要）；再改这个文件前要重新取得租约并重读 | 原持有者 |
 | 你持有的文件被别的会话的 Bash 命令改了 | 持有者 |
 | 用户给你发了租约，或收回、转走了你的租约 | 当事会话 |
 | 某个仓库的当前分支变了 | 在这个仓库里持有租约的会话 |
 
 路径一释放就被等待的会话接走时，不发「已释放」。
+
+**让出的通知排在最前。** 一个会话这一轮结束之后被让出的租约，通知在它下一轮的第一个 hook 里注入（`UserPromptSubmit`；续接时是 `SessionStart`），放在注入内容的最前面，模型在这一轮做任何事之前就看到：
+
+```
+tcas: while this session was idle, these leases were given to other sessions:
+  web/src/api/client.ts    to claude:b7c2… "Add the export endpoint call to the API client"
+You had committed them; nothing of yours is lost. Before changing them again, request them
+again (tcas lease acquire …) and re-read them: they may have changed since.
+```
 
 **别的会话开工的通知**
 
@@ -538,7 +551,9 @@ Claude Code 2.1.327，macOS，无界面模式（`claude -p`），plugin 用 `--p
 | `--no-verify` 跳过 `pre-commit`，不跳过 `post-commit` | 提交成功，`pre-commit` 没运行，`post-commit` 运行了 |
 | 钩子继承调用者的环境变量 | 带 `TCAS_SESSION=A` 运行 `git commit`，钩子里读到了 |
 | `pre-rebase` 能拦变基 | `git rebase` 和 `git pull --rebase` 都被拒，分支没有变 |
-| `reference-transaction` 能在 stash 动工作目录之前拦住它 | 在 `refs/stash` 更新时拒绝：`git stash` 和 `git stash -u` 都失败，改动和未跟踪文件都还在。只拦新建的 stash 时，`apply`、`drop`、`pop` 照常 |
+| `reference-transaction` 能在 stash 动工作目录之前拦住它 | 在 `refs/stash` 更新时拒绝：`git stash` 和 `git stash -u` 都失败，改动和未跟踪文件都还在。只拦新建的 stash 时，`apply`、`drop`、`pop` 照常。钩子每个阶段触发一次，在 `prepared` 拒绝有效（2026-11-23 复测） |
+| 提交钩子里的 `GIT_INDEX_FILE` | `git commit --only -- a.txt`（另有 `b.txt` 被暂存）：`pre-commit` 里这个变量指向 `.git/next-index-<pid>.lock`；带着它 `git diff --cached` 是 `a.txt`，去掉它是 `b.txt`。`post-commit` 里去掉它之后查 `a.txt`，已经是干净的（2026-11-23） |
+| git 目录里的文件 | `.git/` 下的文件 `git check-ignore` 报不被排除，`git status` 改了也不列（2026-11-23） |
 | 切换分支没有干净的拦法 | 在 `HEAD` 更新时拒绝：分支没变，但目标分支的文件已经出现在工作目录里 |
 | `post-checkout` 分得清切分支和还原文件 | 切分支时第三个参数是 1；`git checkout -- <文件>`、`git restore`、`git checkout .` 时是 0 |
 | `reset --hard` 和 `clean` 不触发工作目录相关的钩子 | `reset --hard` 只有引用更新；`clean -f` 什么都不触发 |
@@ -626,7 +641,7 @@ Codex 的沙箱能把 Bash 的写权限收窄到指定路径（design.md 第 10.
 - 做较大的改动之前，先申请再动手：`tcas lease acquire <目录>/ --brief "<一句话：改什么、为什么>"`。较大的改动指：三个或更多文件、一个目录或模块、要新建文件、重命名或批量替换、要用脚本来改。
 - 目录覆盖它下面的一切，包括还没建的文件。也可以列具体文件，或者几个目录一起申请。有一条拿不到就一条都不给，这时还没有改任何东西，最容易调整。
 - 申请的范围以够用为准。目录太大（默认超过 200 个文件）会被拒绝，换成更小的目录。
-- 申请到的路径超过 30 分钟没有用到（没读、没改），别的会话来申请时会让给它，你会收到通知；还要用就再申请一次。改过没提交的文件不会让出。
+- 申请到的路径超过 30 分钟没有用到（没读、没改），别的会话来申请时会让给它，你会收到通知；还要用就再申请一次。已经提交过的路径，在你这一轮结束之后有人来要也会让出，下一轮开始时你会被告知。改过没提交的文件不会让出。
 - `tcas lease list` 看自己持有什么，`tcas lease who <路径>` 看谁占着，`tcas status` 看全部。
 - 提交用 `tcas commit -m "…"`，它只提交你改过的文件。改动分属几个仓库时，它在每个仓库各提交一次。不要用 `git add -A`、`git commit -a`、`git stash`，不要切换分支、变基或合并；这些命令在有别的会话工作时会被拒绝。
 - 做完之后把申请的目录释放掉：`tcas lease release <目录>/`。改过没提交的文件仍然归你。

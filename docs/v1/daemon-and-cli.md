@@ -20,6 +20,7 @@
 
 - **每个用户一个进程**，管这台机器上的所有 workspace。
 - **启动**：`tcas` 的任何命令连不上套接字时自动启动它（先拿 `tcasd.pid` 的文件锁，拿不到说明别人正在启动，等套接字出现）。也可以 `tcas daemon start` 手动启动。
+- **和启动它的进程脱开**：自动启动的 tcasd 多半是某个会话的 hook 或 git 钩子拉起来的。它要 `setsid` 进新的会话、当前目录换到 `/`、标准输入输出接到日志，环境里去掉 `TCAS_SESSION`、`CLAUDE_CODE_SESSION_ID` 和 git 的本地变量。否则那个 harness 退出或清理进程组时会把它一起带走，继承来的变量也会让它的 git 查询查错（见下表「git 查询」）。
 - **不自动退出**。没有 workspace 时它只是空等，占用很小。`tcas daemon stop` 停止。
 - **开机自启不做**，第一次用到时会自动启动。
 
@@ -30,12 +31,13 @@ tcasd 做的事：
 | 处理请求 | 每个连接一个请求、一个应答，见第 4 节。`lease.wait` 的连接保持到有结果为止 |
 | 等待 | 维护等待和等待图；有等待时每 5 秒查一次被等待的路径是否干净；被等待的租约到期限时重新判定（[leases.md](leases.md) 第 6、7 节） |
 | 租约判定 | 全部在一个写事务里完成，SQLite 保证串行 |
-| git 查询 | `status`、`check-ignore`、`diff --name-only`、`rev-parse`。只读，都带 `--no-optional-locks`。在路径所属的仓库里运行，涉及几个仓库时并行 |
+| git 查询 | `status`、`check-ignore`、`diff --name-only`、`rev-parse`。只读，都带 `--no-optional-locks`。在路径所属的仓库里运行，涉及几个仓库时并行。tcasd 启动时从自己的环境里去掉 git 的本地变量（`git rev-parse --local-env-vars` 列出的 `GIT_DIR`、`GIT_INDEX_FILE`、`GIT_WORK_TREE` 等），每个 git 子进程也去掉一遍：tcasd 可能是被 git 钩子里的 `tcas` 自动启动的，实测提交钩子里的 `GIT_INDEX_FILE` 指向一个临时索引，继承下来之后所有查询都会查错 |
+| git 钩子的那一行 | 打开、关闭 workspace，加、去掉根，以及发现新仓库时，用 `git config` 在仓库配置里加上或去掉 tcas 的那一行引用（[harness.md](harness.md) 第 5.6 节）。这是 tcasd 唯一会写的仓库文件 |
 | 发现仓库 | 打开 workspace 时和每次打开 Bash 对账窗口时，找出 workspace 里的仓库，包括用 `git worktree list` 找出的链接 worktree（[leases.md](leases.md) 第 3 节）。目录不在了的，它下面的租约释放 |
 | 会话存活检查 | 每 15 秒检查一次 `active` 和 `idle` 会话的进程（PID 加启动时间）。进程不在了就按会话结束处理 |
 | 清理 | 结束超过 7 天的会话、超过 30 天的事件（可配置） |
 
-tcasd 不做的事：不写 workspace 里的任何文件，不启动 harness，不联网，不常驻监听文件变化。各仓库 `.git/config` 里的那一行引用由 `tcas` 命令行进程写。
+tcasd 不做的事：不写 workspace 里的任何文件（除了上面那一行引用），不启动 harness，不联网，不常驻监听文件变化。
 
 **重启后**：workspace、会话、租约、进行中的调用、通知队列、事件都在数据库里。Bash 窗口打开时拍的快照只在内存里，重启后丢失，那几次调用关闭时不对账。等待也只在内存里，`tcas lease wait` 会自动重连并重新登记。
 
@@ -49,7 +51,7 @@ SQLite，WAL 模式。表：
 | `root` | `workspace`、`name`、`path`、`case_insensitive`、`added_by`、`added_at` | workspace 的根目录，一个或多个（[leases.md](leases.md) 第 3 节）。`path` 是规范化后的绝对路径 |
 | `repo` | `workspace`、`root`、`dir`、`kind`、`common_dir`、`last_branch`、`seen_at` | workspace 里发现的检出。`dir` 相对它所在的根。`common_dir` 是它所属仓库的 git 目录，主检出和它的 worktree 相同，用来决定 git 钩子装在哪、何时去掉 |
 | `session` | `id`、`harness`、`state`、`pid`、`pid_started_at`、`cwd`、`title`、`brief`、`started_at`、`last_seen_at`、`ended_at` | `title` 给用户看，`brief` 给别的会话看 |
-| `lease` | `workspace`、`root`、`path`、`is_prefix`、`session`、`state`、`source`、`brief`、`acquired_at`、`touched_at` | 主键（`workspace`，`root`，`path`）。`path` 相对根。其余带路径的表同样另记 `root` |
+| `lease` | `workspace`、`root`、`path`、`path_key`、`is_prefix`、`session`、`state`、`source`、`brief`、`acquired_at`、`touched_at`、`committed_at` | 主键（`workspace`，`root`，`path_key`）。`path` 相对根；`path_key` 是比较用的形式，在不区分大小写的根里折叠了大小写，其余情况和 `path` 相同。其余带路径的表同样另记 `root` |
 | `open_call` | `session`、`agent`、`call_id`、`kind`、`paths`、`background_id`、`opened_at` | 进行中的编辑调用和 Bash 窗口。让出隐式租约之前要查它（[leases.md](leases.md) 第 5 节），所以要持久化 |
 | `notice` | `id`、`session`、`kind`、`body`、`created_at`、`delivered_at` | 待投递的通知 |
 | `interest` | `session`、`workspace`、`path`、`kind`（`denied` 或 `read`） | 路径释放时该通知谁 |
@@ -70,7 +72,7 @@ SQLite，WAL 模式。表：
 | `session.started`、`session.resumed`、`session.ended` | `ended` 带原因：hook、进程不在、被新会话接替 |
 | `lease.granted` | 带 `source`、`brief` |
 | `lease.denied` | 带持有者、申请来自编辑还是命令行 |
-| `lease.released` | 带原因：提交、主动、让出（文件没改成）、过了期限后让出、会话结束、用户强制 |
+| `lease.released` | 带原因：提交、主动、让出（文件没改成）、过了期限后让出、提交过且这一轮结束后让出、会话结束、用户强制 |
 | `lease.orphaned`、`lease.readopted`、`lease.transferred` | |
 | `wait.started`、`wait.granted`、`wait.timeout`、`wait.deadlock`、`wait.cancelled` | 带路径和等了多久；`started` 带 brief；`deadlock` 带环里的会话和路径 |
 | `lease.suggested` | 提醒了先申请（[harness.md](harness.md) 第 6 节），带建议的命令 |
@@ -100,7 +102,7 @@ Unix 套接字上，一个连接发一行 JSON 请求，收一行 JSON 应答，
 - `v` 不匹配时 tcasd 返回 `version_mismatch`，`tcas` 提示升级。
 - 套接字权限 `0600`，只有同一个系统用户能连。不做别的鉴权（[plan.md](plan.md) 第 6 节）。
 
-**命令行用的操作**和第 5 节的命令一一对应：`workspace.open`、`workspace.add`、`workspace.remove`、`workspace.close`、`workspace.list`、`status`、`lease.acquire`、`lease.wait`、`lease.release`、`lease.list`、`lease.who`、`lease.grant`、`lease.transfer`、`session.list`、`session.end`、`commit.prepare`、`commit.done`、`log`、`stats`、`daemon.status`、`daemon.stop`。
+**命令行用的操作**和第 5 节的命令一一对应：`workspace.open`、`workspace.add`、`workspace.remove`、`workspace.close`、`workspace.list`、`status`、`lease.acquire`、`lease.wait`、`lease.release`、`lease.list`、`lease.who`、`lease.grant`、`lease.transfer`、`session.list`、`session.end`、`exempt.list`、`exempt.add`、`exempt.remove`、`commit.prepare`、`commit.done`、`log`、`stats`、`doctor`、`daemon.status`、`daemon.stop`。
 
 **git 钩子用的操作**是 `git.hook`：钩子名、仓库、发起者（会话或用户）、涉及的路径或引用；应答是放行或拒绝加理由。
 
@@ -259,6 +261,7 @@ opened ~/Code/app (mode auto), 3 repositories:
   in ~/.tcas/config.toml.
   ```
 
+- **根是检出的根目录，或者不在任何检出里的目录。** 要打开或加进来的目录在某个检出里面、又不是它的根（如 `web/src`）时拒绝，给出那个检出的根。否则从里面的文件往上找不到 `.git`（[leases.md](leases.md) 第 3 节第 6 步），它们都会被当成不属于任何仓库的文件，git 钩子也装不上。
 - **根不能互相包含**，不管是不是同一个 workspace 的。要打开或加进来的目录在一个已有的根里面，或者包着一个已有的根，都会被拒绝，并说明是哪一个。要把几个单仓库的 workspace 换成它们的上级目录，先关掉它们。
 - 目录里一个仓库都没有也可以打开。这时没有 git 可查，所有租约按「不属于任何仓库的文件」处理（[leases.md](leases.md) 第 3 节）。
 - workspace 的目录不在了（例如它是一个被删掉的 worktree）：tcasd 在下一次请求时发现，自动关闭它，里面的租约全部释放。
@@ -483,6 +486,7 @@ released: 3 file leases.  still held: api/src/auth/ (directory)
 | Bash 越界和归属不确定的次数 | 对账够不够用，要不要上沙箱 |
 | 遗留租约和停滞的租约的数量、存在时长 | 留下脏文件不管有多常见 |
 | 过了期限后让出的次数；其中原持有者之后又来申请同一条路径的次数 | 30 分钟和 10 分钟这两个期限是否合适 |
+| 提交过、这一轮结束后让出的次数；其中原持有者下一轮又来申请同一条路径的次数 | 「这一轮结束」这个条件是否太早 |
 | 命令护栏拒绝的次数，按规则；其中因为看不出要做什么而拒绝的次数 | 规则是否太严，解析够不够 |
 | git 钩子拒绝的次数，按钩子；其中命令护栏没拦到的次数 | 钩子补上了多少护栏漏掉的 |
 | 用 `TCAS_ALLOW=1` 放行的次数 | 用户被检查挡住有多频繁 |
@@ -527,13 +531,13 @@ exempt = ["scratch/"]
 unmanaged = ["pnpm-lock.yaml", "**/*.snap"]
 
 [repos]
-scan_depth = 4                # 从 workspace 根往下找仓库的最大深度
-exclude = []                  # 不当作仓库管理的目录（相对本文件所在的根）。里面的文件不发租约、不拦截
+scan_depth = 4                # 从 workspace 根往下找仓库的最大深度。不想管的仓库用上面的 exempt 划出去
 
 [bash]
 reconcile = true              # 关掉后 Bash 改了什么不对账
 git_guard = true              # 关掉后命令护栏不拦 git 命令
 approve_tcas = true           # hook 自动批准 agent 可用的 tcas 命令（harness.md 第 5.5 节）
+background_window_secs = 60   # 后台命令开着多久之内算正在进行的调用（harness.md 第 5.3 节）
 
 [git_hooks]
 enabled = true                # 打开 workspace 时给各仓库装 git 钩子（harness.md 第 5.6 节）
@@ -557,6 +561,8 @@ default_timeout_secs = 1800   # tcas lease wait 不带 --timeout 时
 max_timeout_secs = 14400
 ```
 
-别的根、以及根里某个仓库的根目录下，也可以各有一份 `.tcas.toml`，可以提交进那个仓库。它只能写 `unmanaged`，路径相对它所在的目录，和 workspace 级的合并。`mode` 和其余设置只认 workspace 级的。
+别的根、以及根里某个仓库的根目录下，也可以各有一份 `.tcas.toml`，可以提交进那个仓库。它只能写 `unmanaged` 和 `exempt`，路径相对它所在的目录，和 workspace 级的合并。`mode`、`roots` 和其余设置只认 workspace 级的。
 
 `.tcas.toml` 变了，tcasd 在下一次请求时重新读。`tcas workspace set mode` 改的是数据库里的值，优先于文件。
+
+`.tcas.toml` 只有用户能改：会话用编辑工具或认得出的 Bash 命令改它会被拒绝（[harness.md](harness.md) 第 4 节）。里面的 `exempt`、`unmanaged`、`[bash]`、`[git_hooks]` 都能关掉保护，被挡住的会话不该能自己改。

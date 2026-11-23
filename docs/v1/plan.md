@@ -34,6 +34,7 @@ crates/
     handlers/                 每个操作一个文件
     git.rs                    git 查询（按仓库，并行）
     repos.rs                  发现 workspace 里的仓库
+    githooks.rs               在各仓库的 git 配置里加上、去掉那一行引用；探测 git 是否支持配置式钩子
     liveness.rs               会话存活检查
   tcas/
     main.rs                   命令
@@ -43,7 +44,7 @@ crates/
       claude.rs               Claude Code 的输入输出格式
       codex.rs
     commit.rs
-    githooks.rs               安装和去掉各仓库的 git 钩子；tcas git-hook 的入口
+    githook.rs                tcas git-hook 的入口：读钩子的参数和环境，问 tcasd
 plugins/
   claude/                     见 harness.md 第 1 节
   codex/
@@ -62,11 +63,11 @@ tests/
 
 **内容**
 
-- `tcas-core` 的路径、租约判定（文件和目录）、期限、等待和死锁检查。
-- workspace 是一个目录：发现里面的仓库，git 查询在路径所属的仓库里做，从第一天就按这个结构写。
+- `tcas-core` 的路径（含豁免的目录和被 git 排除的路径）、租约判定（文件和目录）、期限、等待和死锁检查。
+- workspace 有一个或几个根，每个根里自动发现仓库，git 查询在路径所属的仓库里做，从第一天就按这个结构写。
 - tcasd：启动、锁、套接字、数据库、会话存活检查。
-- 命令：`workspace open/close/list`、`status`、`lease acquire/wait/release/list/who/grant/transfer`、`session list/end`、`daemon`、`log`。
-- 身份用环境变量 `TCAS_SESSION` 手动指定，还没有 hook。
+- 命令：`workspace open/add/remove/close/list`、`status`、`lease acquire/wait/release/list/who/grant/transfer`、`session list/end`、`exempt list/add/remove`、`daemon`、`log`。
+- 身份用环境变量 `TCAS_SESSION` 手动指定，还没有 hook。这样建立的会话没有登记过进程，存活检查跳过它们，用 `tcas session end` 结束。
 
 **完成的标志**：两个终端各设一个 `TCAS_SESSION`，按 [leases.md](leases.md) 的规则互相申请、拒绝、释放，包括按目录申请；一个终端等另一个持有的路径，对方释放后当场拿到；两个终端互相等时，后一个被拒；杀掉 tcasd 再启动，租约还在；打开一个装着两个仓库的目录，两个仓库都被发现。
 
@@ -75,13 +76,15 @@ tests/
 **内容**
 
 - 把探针整理进 `tests/probe/`，做成可以重复跑的脚本，输出一份和 [harness.md](harness.md) 第 8 节对应的结果表。
-- `tcas hook claude`：`SessionStart`、`UserPromptSubmit`、编辑工具的 `PreToolUse` 和 `PostToolUse`、`Stop`、`SubagentStop`、`SessionEnd`。
+- `tcas hook claude`：`SessionStart`、`UserPromptSubmit`、编辑工具的 `PreToolUse` 和 `PostToolUse`、`Read|Grep` 的 `PostToolUse`（只更新租约的使用时间，读取提示在里程碑 4）、`Stop`、`SubagentStop`、`SessionEnd`。
 - plugin 目录、`bin/tcas` 转发脚本、`tcas plugin path`。
 - 失败即拒绝的各条路径（[harness.md](harness.md) 第 7 节）。
-- 拒绝理由里的等待命令；Bash 的 `PreToolUse` 里对 `tcas` 命令的处理（批准、不开窗口、把等待改成后台运行）；等待结果的通知。动手前先在交互模式下实测后台等待的唤醒和改写（[harness.md](harness.md) 第 9 节）。
+- 拒绝理由里的等待命令；Bash 的 `PreToolUse` 里对 `tcas` 命令的处理（批准、不开窗口、把等待改成后台运行）。动手前先在交互模式下实测后台等待的唤醒和改写（[harness.md](harness.md) 第 9 节）。
+- 通知队列和投递，先只用于等待的结果和租约让出；其余各类通知在里程碑 4。
+- 改到 workspace 外面的检出：记下，每个（会话，检出）提示一次（[leases.md](leases.md) 第 3 节）。
 - 会话结束的处理、遗留租约、续接后接回。
 
-**完成的标志**：第 4 节用例 1 到 8、21 到 26、28 到 34、36 到 39、41、42、46、48、69、70、72、77 到 82、84、86、88、90 到 100 通过。此时已经可以日常使用，Bash 这一路还没有保护。
+**完成的标志**：第 4 节用例 1 到 8、21 到 26、28 到 34、36 到 39、41、42、48、69、70、72、78、80 到 82、86、88、90、92 到 94、97 到 100、102、103 通过。此时已经可以日常使用，Bash 这一路还没有保护。
 
 ### 里程碑 3：Bash
 
@@ -93,13 +96,13 @@ tests/
 - `tcas commit`，改动分属几个仓库时每个仓库提交一次。
 - 分支变化的检测。
 
-**完成的标志**：第 4 节用例 9 到 15、27、35、43 到 45、47、49 到 62、71、73 到 76、83、85、87、89、101 通过。
+**完成的标志**：第 4 节用例 9 到 15、27、35、43 到 47、49 到 62、71、73 到 76、79、83 到 85、87、89、96、101、104 到 106 通过。
 
 ### 里程碑 4：提示、通知、安装
 
 **内容**
 
-- 读取提示、通知队列和投递。
+- 读取提示，其余各类通知（[harness.md](harness.md) 第 6 节的表）。
 - `SessionStart` 的状态注入，压缩后的重新注入。
 - `skills/tcas/SKILL.md`。
 - 先申请再动手：会话开始时的建议，改到第三个文件时的提醒。
@@ -107,7 +110,7 @@ tests/
 - `.tcas.toml`、`unmanaged`、`strict` 模式。
 - 做完 [harness.md](harness.md) 第 9 节里 Claude Code 的未测项。
 
-**完成的标志**：第 4 节用例 16 到 20、40、63 到 68 通过；在一个真实项目里同时开两三个会话用一周。
+**完成的标志**：第 4 节用例 16 到 20、40、63 到 68、77、91、95 通过；在一个真实项目里同时开两三个会话用一周。
 
 ### 里程碑 5：统计
 
@@ -132,7 +135,7 @@ tests/
 | # | 做法 | 预期 |
 |---|---|---|
 | 1 | 会话 A 用编辑工具改 `a.txt` | 成功；A 持有 `a.txt`（`edit`） |
-| 2 | A 持有 `a.txt` 且有未提交改动，会话 B 用编辑工具改它 | 被拒；文件内容不变；B 收到的理由里有 A 的标题 |
+| 2 | A 持有 `a.txt` 且有未提交改动，会话 B 用编辑工具改它 | 被拒；文件内容不变；B 收到的理由里有 A 的会话 ID 和 brief 那一行，没有 A 的标题 |
 | 3 | A 事先 `lease acquire src/`，B 改 `src/x.ts` | 被拒 |
 | 4 | A 申请 `a.txt` 和 `b.txt`，`b.txt` 被 B 持有 | 退出码 3；A 一条也没拿到 |
 | 5 | A 改了 `a.txt` 后结束，没有提交；B 改 `a.txt` | 被拒，理由说明是遗留租约 |
@@ -167,7 +170,7 @@ tests/
 | # | 做法 | 预期 |
 |---|---|---|
 | 21 | A 持有 `a.txt` 且有未提交改动，B 用编辑工具改它 | 拒绝理由里有一条可以直接运行的 `tcas lease wait` 命令，并说明要作为后台命令运行 |
-| 22 | 接上例，B 用后台 Bash 运行 `tcas lease wait a.txt`，接着做别的；A 随后 `tcas commit` | B 启动等待的工具调用立刻返回；A 提交后 B 持有 `a.txt`（`wait`）；B 在当前工具调用结束后收到授予的通知；B 再改成功 |
+| 22 | 接上例，B 用后台 Bash 运行 `tcas lease wait a.txt`，接着做别的；A 随后提交 `a.txt`（里程碑 2 里用 `git commit -- a.txt`，靠 5 秒一次的检查发现；里程碑 3 之后用 `tcas commit`，当场发现） | B 启动等待的工具调用立刻返回；A 提交后 B 持有 `a.txt`（`wait`）；B 在当前工具调用结束后收到授予的通知；B 再改成功 |
 | 23 | B 在后台运行 `tcas lease wait a.txt --timeout 3`，A 不释放 | 命令退出码 4；B 没有拿到任何租约，收到超时的通知；tcasd 里没有残留的等待 |
 | 24 | A 持有 `a.txt` 并在等 `b.txt`；B 持有 `b.txt`，再等 `a.txt` | B 的命令立即返回，退出码 5，输出里说明了环；A 的等待不受影响 |
 | 25 | B 在后台运行 `tcas lease wait a.txt` 后结束这一轮，A 提交 | B 被唤醒；hook 注入了授予的通知；B 持有 `a.txt` |
@@ -291,7 +294,12 @@ tests/
 | 93 | A 用编辑工具改 `/tmp/scratch-repo/a.txt`，那是一个 git 检出 | 放行，没有「加进 workspace」的提示，`tcas status` 里不列这个目录 |
 | 94 | 用户和会话分别运行 `tcas workspace open /tmp/scratch-repo`；用 `/private/tmp/scratch-repo` 再试一次 | 四次都被拒绝，说明是哪一条豁免 |
 | 95 | `.tcas.toml` 里 `exempt = ["scratch/"]`；A 持有 `src/`；B 改 `scratch/n.txt`；A 运行 `echo x > scratch/m.txt`；A 运行 `tcas lease acquire scratch/` | B 成功，没有租约；对账不给 A 记 `scratch/m.txt`；申请的输出说明这个目录不归 tcas 管 |
-| 96 | A 用编辑工具改 `~/.tcas/config.toml`；A 运行 `echo x >> ~/.tcas/config.toml`；A 运行 `tcas exempt add ~/Code` | 三次都被拒 |
+| 96 | A 用编辑工具改 `~/.tcas/config.toml` 和 workspace 根下的 `.tcas.toml`；A 运行 `echo x >> ~/.tcas/config.toml` 和 `echo x >> .tcas.toml`；A 运行 `tcas exempt add ~/Code` | 五次都被拒 |
+| 102 | 在仓库里用编辑工具改 `.git/info/exclude`、`.git/config` | 放行，没有租约 |
+| 103 | 用户 `tcas workspace open web/src`（`web/` 是一个检出） | 被拒绝，输出里给出 `web/` |
+| 104 | A 在后台运行一条一直不退出的命令；61 秒后 B 用 Bash 新建一个没人持有的文件；C 去改 A 持有的、干净的隐式租约的文件 | B 取得这个文件的租约；C 成功，A 的租约让出 |
+| 105 | A `lease acquire a.txt src/auth/`，改了 `a.txt` 和 `src/auth/x.ts` 并 `tcas commit`，没有释放；B 在后台等 `a.txt`；A 接着读别的文件，然后结束这一轮；用户再给 A 发一条消息 | A 这一轮结束之前 B 没有拿到；`Stop` 之后 B 当场拿到 `a.txt`，C 改 `src/auth/y.ts` 成功；A 下一轮的 `UserPromptSubmit` 注入的内容以让出的通知开头，列出 `a.txt` 和 `src/auth/` |
+| 106 | 同上，但 A 没有提交，`a.txt` 有未提交改动；A 结束这一轮 | B 没有拿到，A 不被标为停滞，直到超过停滞的时长 |
 
 **被 git 排除的路径**
 
@@ -325,7 +333,7 @@ tests/
 | git 钩子和仓库已有的钩子管理工具冲突 | 提交流程被破坏 | 用配置式钩子，不碰 `.git/hooks/` 和 `core.hooksPath`；实测两边并存。git 不支持配置式钩子时不装 |
 | `reference-transaction` 钩子拖慢引用更新多的操作 | 大的变基变慢 | 钩子对无关的引用立即退出、不连 tcasd；里程碑 3 实测 `tcas git-hook` 的开销；可以单独关掉 |
 | hook 的开销 | 每次编辑多一次进程启动和一次套接字往返；每次 Bash 多两次 `git status` | 目标：编辑的 hook 在 20 毫秒内，Bash 的两个 hook 各在 50 毫秒内（中等仓库）。里程碑 2、3 各测一次 |
-| workspace 里仓库很多 | 每次 Bash 调用都要给每个仓库拍两次快照 | 各仓库并行（本机 12 个仓库约 30 毫秒）；`[repos] exclude` 排除不需要管的；里程碑 3 测一次 |
+| workspace 里仓库很多 | 每次 Bash 调用都要给每个仓库拍两次快照 | 各仓库并行（本机 12 个仓库约 30 毫秒）；不需要管的仓库用 `.tcas.toml` 的 `exempt` 划出去；里程碑 3 测一次 |
 | 大仓库上 `git status` 慢 | Bash 调用变慢 | 建议开启 fsmonitor 和 untracked cache；`[bash] reconcile = false` 可关 |
 | agent 清掉环境变量冒充用户 | 可以关闭 workspace、强制释放别人的租约 | `tcas` 另外用祖先进程认会话。实测五种运行方式里四种祖先链里有 harness 进程，剩下一种环境变量还在。两样同时去掉的蓄意绕过不防；还没登记的会话只靠环境变量 |
 | 被 git 排除的文件被两个会话同时改 | 互相覆盖，没有任何提示（如 `.env.local`、本地的配置文件） | 这类文件本来就不进仓库，对账也看不到；`tcas lease who` 说明一条路径为什么不归管；要管就让 git 跟踪它 |
