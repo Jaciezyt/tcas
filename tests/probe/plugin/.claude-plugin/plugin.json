@@ -1,0 +1,5 @@
+{
+  "name": "tcas-probe",
+  "version": "0.0.1",
+  "description": "Logs every Claude Code hook event to $PROBE_LOG; behaviour switched by files in $PROBE_CTL."
+}

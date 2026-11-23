@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+# probe-anc <label>: log own ancestors + session env, print them.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import importlib.util
+spec = importlib.util.spec_from_file_location("probe_lib", os.path.join(os.path.dirname(os.path.realpath(__file__)), "probe-lib.py"))
+lib = importlib.util.module_from_spec(spec); spec.loader.exec_module(lib)
+import time
+label = sys.argv[1] if len(sys.argv) > 1 else ""
+rec = {"event": "bin-anc", "label": label, "ts": time.time(), "pid": os.getpid(), "ancestors": lib.ancestors(),
+       "env": {k: os.environ.get(k) for k in ["CLAUDE_ENV_FILE", "CLAUDE_PROJECT_DIR", "TCAS_SESSION", "CLAUDE_CODE_SESSION_ID"]}}
+lib.log(rec)
+print("probe-anc %s TCAS_SESSION=%s CLAUDE_CODE_SESSION_ID=%s" % (label, rec["env"]["TCAS_SESSION"], rec["env"]["CLAUDE_CODE_SESSION_ID"]))
