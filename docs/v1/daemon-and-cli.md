@@ -110,7 +110,7 @@ Unix 套接字上，一个连接发一行 JSON 请求，收一行 JSON 应答，
 
 ```ts
 interface HookRequest {
-  harness: 'claude' | 'codex'
+  harness: 'claude' | 'agy' | 'codex'
   event: 'session_start' | 'prompt' | 'pre_tool' | 'post_tool' | 'stop' | 'agent_stop' | 'session_end'
   session: string               // 原生会话 ID
   agent?: string                // 子 agent
@@ -466,7 +466,7 @@ released: 3 file leases.  still held: api/src/auth/ (directory)
 | `tcas hook <harness>` | 供 hook 调用，从标准输入读 harness 的事件。不给人用 |
 | `tcas git-hook <钩子名> [参数…]` | 供 git 钩子调用。所在的检出不在任何 workspace 里时立即放行。不给人用 |
 | `tcas git-hooks install\|remove\|status [仓库]` | 单独给一个仓库装上、去掉 git 钩子，或查看状态 |
-| `tcas plugin install <claude\|codex>` | 生成并安装 plugin |
+| `tcas plugin install <claude\|agy\|codex>` | 生成并安装 plugin |
 | `tcas plugin path <harness>` | 输出 plugin 目录，开发时配合 `--plugin-dir` 用 |
 | `tcas daemon start\|stop\|status` | |
 | `tcas doctor` | 检查：豁免的目录有哪些、有没有和 workspace 的根冲突；tcasd 是否在运行、版本是否一致、plugin 是否安装、当前目录是否在 workspace 里、git 是否支持配置式钩子、各仓库的 git 钩子是否装着 |

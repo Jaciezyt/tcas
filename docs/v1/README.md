@@ -5,7 +5,7 @@
 
 ## 1. 第一版是什么
 
-用户照常自己启动 harness 会话（先 Claude Code，再 Codex）。这些会话在同一个 workspace（一个检出、装着几个仓库的一个目录，或者几个不在一起的目录）里并行改代码时，TCAS 保证同一个文件同一时刻只有一个会话能改，被挡住的会话立刻知道是谁占着，并且可以在后台等。
+用户照常自己启动 harness 会话（先 Claude Code，再 AGY、Codex）。这些会话在同一个 workspace（一个检出、装着几个仓库的一个目录，或者几个不在一起的目录）里并行改代码时，TCAS 保证同一个文件同一时刻只有一个会话能改，被挡住的会话立刻知道是谁占着，并且可以在后台等。
 
 只有两个程序：
 
@@ -83,7 +83,7 @@
 | 文件 | 内容 |
 |---|---|
 | [leases.md](leases.md) | 租约模型：概念、数据结构、路径、申请和释放的规则、不变量 |
-| [harness.md](harness.md) | plugin 的结构、每个 hook 做什么、失败时怎么办、实测结果、Codex |
+| [harness.md](harness.md) | plugin 的结构、每个 hook 做什么、失败时怎么办、实测结果、AGY、Codex |
 | [daemon-and-cli.md](daemon-and-cli.md) | tcasd 的运行方式、存储、协议、`tcas` 的全部命令、配置 |
 | [plan.md](plan.md) | 技术栈、代码结构、里程碑、验收用例、风险 |
 | [walkthrough.md](walkthrough.md) | 三个会话加用户并行工作的完整过程，每一步 tcas 在哪里介入、做什么 |

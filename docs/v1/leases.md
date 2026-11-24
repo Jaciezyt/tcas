@@ -42,7 +42,7 @@ interface Repo {                // 某个根里的一个 git 检出，自动发�
 
 interface Session {
   id: string                    // "<harness>:<原生会话 ID>"，如 "claude:79583356-…"
-  harness: 'claude' | 'codex'
+  harness: 'claude' | 'agy' | 'codex'
   state: 'active' | 'idle' | 'ended'
   pid?: number                  // harness 进程
   pidStartedAt?: Time           // 和 pid 一起判断进程是否还是同一个
@@ -147,7 +147,7 @@ $ tcas workspace add ../app-backend ../app-website
 |---|---|
 | 内置：系统的临时目录 | `/tmp`、`/var/tmp`、`$TMPDIR`，以及它们解析符号链接之后的位置。macOS 上是 `/private/tmp`、`/private/var/tmp`、`/private/var/folders/…/T`（实测），Linux 上另有 `/dev/shm` |
 | 内置：tcas 自己的目录 | `~/.tcas` |
-| 内置：harness 自己的目录 | `~/.claude`、`~/.codex`。会话的记录、计划、记忆、后台任务的输出都在这里或临时目录里（实测 Claude Code 把后台任务的输出放在 `/tmp/claude-<uid>/…`） |
+| 内置：harness 自己的目录 | `~/.claude`、`~/.gemini`、`~/.codex`。会话的记录、计划、记忆、后台任务的输出都在这里或临时目录里（实测 Claude Code 把后台任务的输出放在 `/tmp/claude-<uid>/…`，AGY 把会话记录、artifact、scratch 和后台任务日志放在 `~/.gemini/antigravity-cli/brain/<会话>/…`） |
 | 用户添加：全局 | `~/.tcas/config.toml` 的 `[exempt] paths`，写绝对路径或以 `~` 开头的路径 |
 | 用户添加：按 workspace | `.tcas.toml` 的 `exempt`，相对它所在的根，只对根里面的目录有效 |
 

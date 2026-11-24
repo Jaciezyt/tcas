@@ -460,7 +460,7 @@ A 重读 `export.ts`，改完，跑测试，提交，释放。用户退出两个
 | 压缩上下文之后 | `SessionStart` 重新注入说明和自己持有的路径 | [harness.md](harness.md) 第 6 节 |
 | 子 agent | 算在父会话名下，互相不隔离 | [leases.md](leases.md) 第 9 节 |
 | 项目的目录不在一起，主目录外面还有后端、网站目录 | 用 `tcas workspace add` 放进同一个 workspace；没加的，会话改到时提示一次 | [leases.md](leases.md) 第 3 节 |
-| Codex 会话 | 还没有接入 | [harness.md](harness.md) 第 10 节 |
+| AGY、Codex 会话 | 还没有接入 | [harness.md](harness.md) 第 10、11 节 |
 
 ## 6. 这次过程里能看到的问题
 

@@ -42,11 +42,13 @@ crates/
     hook/
       mod.rs                  公共流程、超时、失败即拒绝
       claude.rs               Claude Code 的输入输出格式
+      agy.rs                  AGY 的输入输出格式
       codex.rs
     commit.rs
     githook.rs                tcas git-hook 的入口：读钩子的参数和环境，问 tcasd
 plugins/
   claude/                     见 harness.md 第 1 节
+  agy/                        见 harness.md 第 10 节
   codex/
 tests/
   e2e/                        用真实的套接字和临时 git 仓库
@@ -118,13 +120,19 @@ tests/
 
 **完成的标志**：拿到一周真实使用的数字，据此回答第 5 节的三个问题。
 
-### 里程碑 6：Codex
+### 里程碑 6：AGY
 
-**内容**：按 [harness.md](harness.md) 第 10 节先跑探针，再写 `hook/codex.rs` 和 plugin。
+**内容**：按 [harness.md](harness.md) 第 10 节先跑探针，再写 `hook/agy.rs`、plugin（`plugins/agy/`）以及 `tcas plugin install agy`、`tcas doctor` 的 AGY 检查。
 
-**完成的标志**：一个 Claude Code 会话和一个 Codex 会话在同一个检出里，用例 1 到 15 中适用的部分通过。
+**完成的标志**：一个 Claude Code 会话和一个 AGY 会话在同一个检出里，用例 1 到 15 中适用的部分通过。
 
-里程碑 5 和 6 互不依赖，可以换顺序。
+### 里程碑 7：Codex
+
+**内容**：按 [harness.md](harness.md) 第 11 节先跑探针，再写 `hook/codex.rs` 和 plugin。
+
+**完成的标志**：一个 Claude Code（或 AGY）会话和一个 Codex 会话在同一个检出里，用例 1 到 15 中适用的部分通过。
+
+里程碑 5、6、7 互不依赖，可以换顺序。
 
 ## 4. 验收用例
 
