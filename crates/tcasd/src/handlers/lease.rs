@@ -109,9 +109,10 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
     let a: WaitArgs = args(req)?;
     let mut list = d.waits();
     let summary = list.summary();
-    let (sid, acq, deadline, started_at, cwd, snapshot, brief_sanitized, holder_keys) =
+    let (sid, acq, deadline, started_at, cwd, snapshot, brief_sanitized, holder_keys, turn) =
         with_tx_inner(d, req, summary, |env| {
             let sid = env.caller.require_session("tcas lease wait")?.to_string();
+            let turn = engine::session_turn(env.c, &sid);
             if a.paths.is_empty() {
                 return Err(Fail::bad("give the paths to wait for"));
             }
@@ -137,7 +138,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
                     acq.ws.as_deref(),
                     Some(&sid),
                     "wait.granted",
-                    json!({ "paths": acq.result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": env.now - started_at }),
+                    json!({ "paths": acq.result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": env.now - started_at, "turn": turn }),
                 )?;
             }
             let snapshot = if acq.result.outcome == Outcome::Denied {
@@ -154,7 +155,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
                     (h.clone(), held.clone(), k)
                 })
                 .collect();
-            Ok((sid, acq, started_at + timeout * 1000, started_at, env.cwd.clone(), snapshot, brief_sanitized, holder_keys))
+            Ok((sid, acq, started_at + timeout * 1000, started_at, env.cwd.clone(), snapshot, brief_sanitized, holder_keys, turn))
         })?;
     let now = tcas_sys::clock::now_ms();
     let mut result = acq.result;
@@ -181,7 +182,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
             Some(&ws_id),
             Some(&sid),
             "wait.deadlock",
-            json!({ "paths": r.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "cycle": r.cycle, "at": "registration" }),
+            json!({ "paths": r.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": 0, "cycle": r.cycle, "at": "registration", "turn": turn }),
         )?;
         let _ = store::notice(&conn, now, &sid, "wait.deadlock", json!({ "workspace": ws_id, "result": r }));
         return Ok(serde_json::to_value(r).unwrap());
@@ -196,7 +197,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
             Some(&ws_id),
             Some(&sid),
             "wait.timeout",
-            json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": now - started_at }),
+            json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": now - started_at, "turn": turn }),
         );
         let _ = store::notice(&conn, now, &sid, "wait.timeout", json!({ "workspace": ws_id, "result": result }));
         return Ok(serde_json::to_value(result).unwrap());
@@ -228,7 +229,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
             Some(&ws_id),
             Some(&sid),
             if a.started_at.is_some() { "wait.resumed" } else { "wait.started" },
-            json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "brief": a.brief }),
+            json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "brief": a.brief, "turn": turn }),
         )?;
         let mut by_holder: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (holder, held, held_key) in &holder_keys {
@@ -566,8 +567,16 @@ pub fn transfer(env: &mut Env, req: &Request) -> R<Value> {
             if l.session == to.id {
                 continue;
             }
+            if let Some(since) = l.stalled_at {
+                env.event(
+                    Some(&l.workspace),
+                    Some(&l.session),
+                    "lease.unstalled",
+                    json!({ "root": l.root, "path": l.path, "stalled_ms": (env.now - since).max(0), "reason": "transferred" }),
+                )?;
+            }
             env.c.execute(
-                "UPDATE lease SET session=?4, state='active', touched_at=?5 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                "UPDATE lease SET session=?4, state='active', touched_at=?5, edited_at=NULL, stalled_at=NULL WHERE workspace=?1 AND root=?2 AND path_key=?3",
                 params![l.workspace, l.root, l.path_key, to.id, env.now],
             )?;
             let disp = ws.display(&l.root, &l.path, l.is_prefix);

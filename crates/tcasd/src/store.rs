@@ -28,12 +28,12 @@ CREATE TABLE IF NOT EXISTS session(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, state TEXT NOT NULL, pid INTEGER,
   pid_started_at INTEGER, cwd TEXT, title TEXT, brief TEXT, broadcast_brief TEXT,
   started_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, ended_at INTEGER,
-  suggested_at INTEGER);
+  suggested_at INTEGER, turn INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS lease(
   workspace TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, path_key TEXT NOT NULL,
   is_prefix INTEGER NOT NULL, repo TEXT, session TEXT NOT NULL, state TEXT NOT NULL,
   source TEXT NOT NULL, brief TEXT, acquired_at INTEGER NOT NULL, touched_at INTEGER NOT NULL,
-  committed_at INTEGER,
+  committed_at INTEGER, edited_at INTEGER, stalled_at INTEGER,
   PRIMARY KEY(workspace, root, path_key));
 CREATE INDEX IF NOT EXISTS lease_session ON lease(session);
 CREATE TABLE IF NOT EXISTS open_call(
@@ -81,6 +81,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("repo", "branch_changed_at", "INTEGER"),
     ("session", "broadcast_brief", "TEXT"),
     ("session", "suggested_at", "INTEGER"),
+    ("session", "turn", "INTEGER NOT NULL DEFAULT 0"),
+    ("lease", "edited_at", "INTEGER"),
+    ("lease", "stalled_at", "INTEGER"),
 ];
 
 fn add_missing_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -158,6 +161,7 @@ pub struct SessionRow {
     pub last_seen_at: i64,
     pub ended_at: Option<i64>,
     pub suggested_at: Option<i64>,
+    pub turn: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +180,8 @@ pub struct LeaseRow {
     pub acquired_at: i64,
     pub touched_at: i64,
     pub committed_at: Option<i64>,
+    pub edited_at: Option<i64>,
+    pub stalled_at: Option<i64>,
 }
 
 fn ws_row(r: &Row) -> rusqlite::Result<WsRow> {
@@ -251,7 +257,7 @@ pub fn all_repos(c: &Connection) -> rusqlite::Result<Vec<RepoRow>> {
 }
 
 const SESSION_COLS: &str =
-    "id, harness, state, pid, pid_started_at, cwd, title, brief, broadcast_brief, started_at, last_seen_at, ended_at, suggested_at";
+    "id, harness, state, pid, pid_started_at, cwd, title, brief, broadcast_brief, started_at, last_seen_at, ended_at, suggested_at, turn";
 
 fn session_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -268,6 +274,7 @@ fn session_row(r: &Row) -> rusqlite::Result<SessionRow> {
         last_seen_at: r.get(10)?,
         ended_at: r.get(11)?,
         suggested_at: r.get(12)?,
+        turn: r.get::<_, Option<i64>>(13)?.unwrap_or(0),
     })
 }
 
@@ -280,7 +287,7 @@ pub fn sessions(c: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     st.query_map([], session_row)?.collect()
 }
 
-const LEASE_COLS: &str = "workspace, root, path, path_key, is_prefix, repo, session, state, source, brief, acquired_at, touched_at, committed_at";
+const LEASE_COLS: &str = "workspace, root, path, path_key, is_prefix, repo, session, state, source, brief, acquired_at, touched_at, committed_at, edited_at, stalled_at";
 
 fn lease_row(r: &Row) -> rusqlite::Result<LeaseRow> {
     let state: String = r.get(7)?;
@@ -299,6 +306,8 @@ fn lease_row(r: &Row) -> rusqlite::Result<LeaseRow> {
         acquired_at: r.get(10)?,
         touched_at: r.get(11)?,
         committed_at: r.get(12)?,
+        edited_at: r.get(13)?,
+        stalled_at: r.get(14)?,
     })
 }
 
@@ -319,7 +328,7 @@ pub fn leases_all(c: &Connection) -> rusqlite::Result<Vec<LeaseRow>> {
 
 pub fn insert_lease(c: &Connection, l: &LeaseRow) -> rusqlite::Result<()> {
     c.execute(
-        &format!("INSERT OR REPLACE INTO lease({LEASE_COLS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
+        &format!("INSERT OR REPLACE INTO lease({LEASE_COLS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"),
         params![
             l.workspace,
             l.root,
@@ -333,7 +342,9 @@ pub fn insert_lease(c: &Connection, l: &LeaseRow) -> rusqlite::Result<()> {
             l.brief,
             l.acquired_at,
             l.touched_at,
-            l.committed_at
+            l.committed_at,
+            l.edited_at,
+            l.stalled_at
         ],
     )?;
     Ok(())
@@ -355,9 +366,21 @@ pub fn event(
     kind: &str,
     payload: Value,
 ) -> rusqlite::Result<()> {
+    event_agent(c, at, ws, session, None, kind, payload)
+}
+
+pub fn event_agent(
+    c: &Connection,
+    at: i64,
+    ws: Option<&str>,
+    session: Option<&str>,
+    agent: Option<&str>,
+    kind: &str,
+    payload: Value,
+) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT INTO event(at, workspace, session, type, payload) VALUES(?1,?2,?3,?4,?5)",
-        params![at, ws, session, kind, payload.to_string()],
+        "INSERT INTO event(at, workspace, session, agent, type, payload) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![at, ws, session, agent, kind, payload.to_string()],
     )?;
     Ok(())
 }
@@ -415,4 +438,25 @@ pub fn events(c: &Connection, f: &EventFilter) -> rusqlite::Result<Vec<EventView
         out.reverse();
     }
     Ok(out)
+}
+
+/// All events for `ws` (plus global session events with `workspace IS NULL`),
+/// in chronological order, for `tcas stats`.
+pub fn events_for_stats(c: &Connection, ws: &str) -> rusqlite::Result<Vec<EventView>> {
+    let mut st = c.prepare(
+        "SELECT seq, at, workspace, session, type, payload FROM event \
+         WHERE workspace=?1 OR workspace IS NULL ORDER BY seq ASC",
+    )?;
+    st.query_map([ws], |r| {
+        let payload: String = r.get(5)?;
+        Ok(EventView {
+            seq: r.get(0)?,
+            at: r.get(1)?,
+            workspace: r.get(2)?,
+            session: r.get(3)?,
+            kind: r.get(4)?,
+            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        })
+    })?
+    .collect()
 }

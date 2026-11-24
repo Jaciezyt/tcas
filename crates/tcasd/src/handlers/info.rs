@@ -91,6 +91,7 @@ pub fn status(env: &mut Env, req: &Request) -> R<Value> {
             released.push(ws.path_ref(&l.root, &l.path, l.is_prefix));
         }
     }
+    engine::sync_stalled(env, &ws)?;
     let leases = store::leases_ws(env.c, &ws.row.id)?;
     let lviews = views(env, &leases)?;
     let mut sessions = Vec::new();

@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
 use tcas_core::acquire::{self as dec, Held, Want};
@@ -35,12 +36,24 @@ pub struct Env<'a> {
     pub g: Global,
     pub now: i64,
     pub caller: Caller,
+    pub agent: Option<String>,
     pub cwd: PathBuf,
     /// Sessions waiting, with the paths they wait for (a snapshot taken
     /// before the database lock; waits are always locked first).
     pub waiting: HashMap<String, Vec<String>>,
     /// Leases released in this transaction that may trigger `lease.freed`.
     pub freed: std::cell::RefCell<Vec<Freed>>,
+}
+
+static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
+
+pub fn session_turn(c: &Connection, sid: &str) -> i64 {
+    c.query_row("SELECT turn FROM session WHERE id=?1", [sid], |r| r.get::<_, Option<i64>>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or(0)
 }
 
 impl Env<'_> {
@@ -54,7 +67,7 @@ impl Env<'_> {
     }
 
     pub fn event(&self, ws: Option<&str>, session: Option<&str>, kind: &str, payload: serde_json::Value) -> R<()> {
-        store::event(self.c, self.now, ws, session, kind, payload)?;
+        store::event_agent(self.c, self.now, ws, session, self.agent.as_deref(), kind, payload)?;
         Ok(())
     }
 
@@ -285,6 +298,14 @@ pub fn release(env: &Env, l: &LeaseRow, reason: &str, by: Option<&str>) -> R<()>
 }
 
 pub fn release_with_commit(env: &Env, l: &LeaseRow, reason: &str, by: Option<&str>, commit: Option<&str>) -> R<()> {
+    if let Some(since) = l.stalled_at {
+        env.event(
+            Some(&l.workspace),
+            Some(&l.session),
+            "lease.unstalled",
+            json!({ "root": l.root, "path": l.path, "stalled_ms": (env.now - since).max(0), "reason": reason }),
+        )?;
+    }
     store::delete_lease(env.c, l)?;
     env.c.execute(
         "DELETE FROM read_hint WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
@@ -294,7 +315,15 @@ pub fn release_with_commit(env: &Env, l: &LeaseRow, reason: &str, by: Option<&st
         "DELETE FROM wait_notified WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
         params![l.workspace, l.root, l.path_key, l.session],
     )?;
-    let mut p = json!({ "root": l.root, "path": l.path, "is_prefix": l.is_prefix, "reason": reason, "source": l.source.as_str() });
+    let turn = session_turn(env.c, &l.session);
+    let mut p = json!({
+        "root": l.root,
+        "path": l.path,
+        "is_prefix": l.is_prefix,
+        "reason": reason,
+        "source": l.source.as_str(),
+        "turn": turn,
+    });
     if let Some(b) = by {
         p["by"] = json!(b);
     }
@@ -370,8 +399,16 @@ pub fn end_session(env: &Env, sid: &str, reason: &str) -> R<()> {
             if l.is_prefix || l.repo.is_none() || !dirty.contains(&(l.root.clone(), l.path_key.clone())) {
                 release(env, l, "session_ended", None)?;
             } else if l.state != LeaseState::Orphaned {
+                if let Some(since) = l.stalled_at {
+                    env.event(
+                        Some(&l.workspace),
+                        Some(sid),
+                        "lease.unstalled",
+                        json!({ "root": l.root, "path": l.path, "stalled_ms": (env.now - since).max(0), "reason": "orphaned" }),
+                    )?;
+                }
                 env.c.execute(
-                    "UPDATE lease SET state='orphaned' WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                    "UPDATE lease SET state='orphaned', stalled_at=NULL WHERE workspace=?1 AND root=?2 AND path_key=?3",
                     params![l.workspace, l.root, l.path_key],
                 )?;
                 env.event(Some(&l.workspace), Some(sid), "lease.orphaned", json!({ "root": l.root, "path": l.path }))?;
@@ -384,6 +421,127 @@ pub fn end_session(env: &Env, sid: &str, reason: &str) -> R<()> {
     env.c.execute("DELETE FROM read_hint WHERE session=?1 OR holder=?1", [sid])?;
     env.c.execute("DELETE FROM wait_notified WHERE waiter=?1 OR holder=?1", [sid])?;
     env.event(None, Some(sid), "session.ended", json!({ "reason": reason }))?;
+    Ok(())
+}
+
+/// Synchronizes `stalled_at` and emits `lease.stalled` / `lease.unstalled`
+/// transitions for leases in `ws` (daemon-and-cli.md section 5, "统计").
+/// Only queries git when a candidate lease is past the stalled threshold or
+/// already marked stalled.
+pub fn sync_stalled(env: &Env, ws: &Ws) -> R<()> {
+    let leases = store::leases_ws(env.c, &ws.row.id)?;
+    if leases.is_empty() {
+        return Ok(());
+    }
+    let ctx = Ctx::load(env.c)?;
+    let threshold_ms = ws.cfg.lease.stalled_after_secs as i64 * 1000;
+    let window = ws.cfg.bash.background_window_secs as i64 * 1000;
+    let mut candidates: Vec<&LeaseRow> = Vec::new();
+    for l in &leases {
+        if l.is_prefix || l.repo.is_none() {
+            continue;
+        }
+        let s = ctx.sessions.get(&l.session);
+        let holder_state = s.map(|s| s.state.as_str()).unwrap_or("ended");
+        let idle_ms = s.map(|s| env.now - s.last_seen_at).unwrap_or(0);
+        let has_call = ctx.calls.get(&l.session).is_some_and(|cs| {
+            cs.iter().any(|c| c.kind == "edit" || !c.background || env.now - c.opened_at < window)
+        });
+        let eligible = l.state == LeaseState::Active
+            && holder_state != "ended"
+            && idle_ms > threshold_ms
+            && !has_call
+            && !env.waiting.contains_key(&l.session);
+        if eligible || l.stalled_at.is_some() {
+            candidates.push(l);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let dirty = dirty_of(env, ws, &candidates);
+    for l in candidates {
+        let s = ctx.sessions.get(&l.session);
+        let holder_state = s.map(|s| s.state.as_str()).unwrap_or("ended");
+        let idle_ms = s.map(|s| env.now - s.last_seen_at).unwrap_or(0);
+        let has_call = ctx.calls.get(&l.session).is_some_and(|cs| {
+            cs.iter().any(|c| c.kind == "edit" || !c.background || env.now - c.opened_at < window)
+        });
+        let is_dirty = dirty.contains(&(l.root.clone(), l.path_key.clone()));
+        let stalled_now = is_dirty
+            && l.state == LeaseState::Active
+            && holder_state != "ended"
+            && idle_ms > threshold_ms
+            && !has_call
+            && !env.waiting.contains_key(&l.session);
+        match (l.stalled_at, stalled_now) {
+            (None, true) => {
+                let last_seen = s.map(|s| s.last_seen_at).unwrap_or(env.now - threshold_ms);
+                let since = (last_seen + threshold_ms).min(env.now);
+                env.c.execute(
+                    "UPDATE lease SET stalled_at=?4 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                    params![l.workspace, l.root, l.path_key, since],
+                )?;
+                env.event(
+                    Some(&l.workspace),
+                    Some(&l.session),
+                    "lease.stalled",
+                    json!({ "root": l.root, "path": l.path, "since": since }),
+                )?;
+            }
+            (Some(since), false) => {
+                env.c.execute(
+                    "UPDATE lease SET stalled_at=NULL WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                    params![l.workspace, l.root, l.path_key],
+                )?;
+                let reason = if !is_dirty { "clean" } else { "active" };
+                env.event(
+                    Some(&l.workspace),
+                    Some(&l.session),
+                    "lease.unstalled",
+                    json!({ "root": l.root, "path": l.path, "stalled_ms": (env.now - since).max(0), "reason": reason }),
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Records the first actual modification of managed file leases held by `sid`.
+/// For leases acquired beforehand (`cli`, `grant`, `wait`), emits one
+/// `lease.edited` event so `tcas stats` can distinguish touched-and-modified
+/// files from untouched ones.
+pub fn mark_edited(env: &Env, sid: &str, paths: &[String], via: &str) -> R<()> {
+    let mine = store::leases_session(env.c, sid)?;
+    if mine.is_empty() {
+        return Ok(());
+    }
+    for p in paths {
+        let r = env.resolve(p);
+        let Some(m) = r.managed else { continue };
+        if r.is_dir {
+            continue;
+        }
+        let Some(l) = mine.iter().find(|l| !l.is_prefix && l.workspace == m.ws && l.root == m.root && l.path_key == m.key) else {
+            continue;
+        };
+        if l.edited_at.is_some() {
+            continue;
+        }
+        env.c.execute(
+            "UPDATE lease SET edited_at=?4 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+            params![l.workspace, l.root, l.path_key, env.now],
+        )?;
+        if !l.source.is_implicit() {
+            env.event(
+                Some(&l.workspace),
+                Some(sid),
+                "lease.edited",
+                json!({ "root": l.root, "path": l.path, "source": l.source.as_str(), "via": via }),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -519,6 +677,10 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
     let is_dirty = |i: usize| dirty.contains(&(leases[i].root.clone(), leases[i].path_key.clone()));
     let d = dec::decide(req.session, &wants, &held, |i| ctx.holder(ws, &leases[i], env.now), is_dirty, env.now, &lim);
 
+    let req_id = NEXT_REQ.fetch_add(1, Ordering::Relaxed);
+    let req_turn = session_turn(env.c, req.session);
+    let brief = req.brief.as_deref().and_then(|b| brief::sanitize(b, ws.cfg.brief.max_chars));
+
     for &i in &d.housekeeping {
         release(env, &leases[i], "orphan_clean", None)?;
     }
@@ -533,6 +695,21 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
             if seen.insert((b.want, b.lease)) {
                 let dirty_v = if l.is_prefix || l.repo.is_none() { None } else { Some(is_dirty(b.lease)) };
                 let mut view = lease_view(env, ws, l, &ctx, dirty_v);
+                if view.stalled && l.stalled_at.is_none() {
+                    let threshold_ms = ws.cfg.lease.stalled_after_secs as i64 * 1000;
+                    let last_seen = ctx.sessions.get(&l.session).map(|s| s.last_seen_at).unwrap_or(env.now - threshold_ms);
+                    let since = (last_seen + threshold_ms).min(env.now);
+                    env.c.execute(
+                        "UPDATE lease SET stalled_at=?4 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                        params![l.workspace, l.root, l.path_key, since],
+                    )?;
+                    env.event(
+                        Some(&l.workspace),
+                        Some(&l.session),
+                        "lease.stalled",
+                        json!({ "root": l.root, "path": l.path, "since": since }),
+                    )?;
+                }
                 view.holder_title = None;
                 acq.result.blockers.push(BlockerView {
                     want: want.clone(),
@@ -552,20 +729,30 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
             )?;
         }
         let holders: BTreeSet<&str> = acq.holders.iter().map(|h| h.0.as_str()).collect();
+        let mut blocked_paths = Vec::new();
+        for b in &acq.result.blockers {
+            if !blocked_paths.contains(&b.want.display) {
+                blocked_paths.push(b.want.display.clone());
+            }
+        }
+        let holder_has_brief = acq.result.blockers.iter().any(|b| b.lease.brief.is_some());
         env.event(
             Some(&ws_id),
             Some(req.session),
             "lease.denied",
             json!({
                 "paths": acq.result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(),
+                "blocked": blocked_paths,
                 "holders": holders,
                 "via": req.source.as_str(),
+                "brief": brief,
+                "holder_has_brief": holder_has_brief,
+                "turn": req_turn,
+                "req": req_id,
             }),
         )?;
         return Ok(acq);
     }
-
-    let brief = req.brief.as_deref().and_then(|b| brief::sanitize(b, ws.cfg.brief.max_chars));
 
     // Granted: yields first, then the new leases.
     let mut yielded_to_notify: BTreeMap<String, Vec<(String, &str)>> = BTreeMap::new();
@@ -624,27 +811,68 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
                         acquired_at: env.now,
                         touched_at: env.now,
                         committed_at: None,
+                        edited_at: (req.source == Source::Bash).then_some(env.now),
+                        stalled_at: None,
                     };
                     store::insert_lease(env.c, &row)?;
                     env.event(
                         Some(&ws_id),
                         Some(req.session),
                         "lease.granted",
-                        json!({ "root": m.root, "path": m.rel, "is_prefix": false, "source": req.source.as_str(), "under": l.path }),
+                        json!({
+                            "root": m.root,
+                            "path": m.rel,
+                            "is_prefix": false,
+                            "source": req.source.as_str(),
+                            "under": l.path,
+                            "under_source": l.source.as_str(),
+                            "repo": m.repo,
+                            "turn": req_turn,
+                        }),
                     )?;
                 }
                 let mut source = l.source;
-                if exact && matches!(req.source, Source::Cli | Source::Grant) && !l.source.is_explicit() {
+                let upgraded = exact && matches!(req.source, Source::Cli | Source::Grant) && !l.source.is_explicit();
+                if upgraded {
                     source = req.source;
                 }
                 let new_brief = if exact && brief.is_some() { brief.clone() } else { l.brief.clone() };
+                let mark_bash_edit = exact && !r.is_dir && req.source == Source::Bash && l.edited_at.is_none();
+                let new_edited_at = if mark_bash_edit { Some(env.now) } else { l.edited_at };
                 env.c.execute(
-                    "UPDATE lease SET touched_at=?4, source=?5, brief=?6 WHERE workspace=?1 AND root=?2 AND path_key=?3",
-                    params![l.workspace, l.root, l.path_key, env.now, source.as_str(), new_brief],
+                    "UPDATE lease SET touched_at=?4, source=?5, brief=?6, edited_at=?7 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                    params![l.workspace, l.root, l.path_key, env.now, source.as_str(), new_brief, new_edited_at],
                 )?;
+                if mark_bash_edit && !l.source.is_implicit() {
+                    env.event(
+                        Some(&ws_id),
+                        Some(req.session),
+                        "lease.edited",
+                        json!({ "root": l.root, "path": l.path, "source": l.source.as_str(), "via": "bash" }),
+                    )?;
+                }
+                if upgraded {
+                    env.event(
+                        Some(&ws_id),
+                        Some(req.session),
+                        "lease.granted",
+                        json!({
+                            "root": m.root,
+                            "path": m.rel,
+                            "is_prefix": r.is_dir,
+                            "source": req.source.as_str(),
+                            "brief": brief,
+                            "upgraded": true,
+                            "files": dir_files.get(&wi).copied(),
+                            "repo": m.repo,
+                            "req": req_id,
+                            "turn": req_turn,
+                        }),
+                    )?;
+                }
                 acq.result.granted.push(Granted {
                     path: pr,
-                    renewed: true,
+                    renewed: !upgraded,
                     files: dir_files.get(&wi).copied(),
                     foreign_changes: false,
                     changed_in: None,
@@ -665,13 +893,25 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
                     acquired_at: env.now,
                     touched_at: env.now,
                     committed_at: None,
+                    edited_at: (req.source == Source::Bash).then_some(env.now),
+                    stalled_at: None,
                 };
                 store::insert_lease(env.c, &row)?;
                 env.event(
                     Some(&ws_id),
                     Some(req.session),
                     "lease.granted",
-                    json!({ "root": m.root, "path": m.rel, "is_prefix": r.is_dir, "source": req.source.as_str(), "brief": brief }),
+                    json!({
+                        "root": m.root,
+                        "path": m.rel,
+                        "is_prefix": r.is_dir,
+                        "source": req.source.as_str(),
+                        "brief": brief,
+                        "files": dir_files.get(&wi).copied(),
+                        "repo": m.repo,
+                        "req": req_id,
+                        "turn": req_turn,
+                    }),
                 )?;
                 acq.result.granted.push(Granted {
                     path: pr,

@@ -605,3 +605,206 @@ pub struct DoctorDaemonReply {
     pub conflicts: Vec<String>,
     pub workspace: Option<DoctorWorkspace>,
 }
+
+// ---------------------------------------------------------------------------
+// `tcas stats` (daemon-and-cli.md section 5, "统计"; plan.md section 5)
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathCount {
+    pub path: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCount {
+    pub rule: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookCount {
+    pub hook: String,
+    pub count: usize,
+    pub missed_by_guard: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurationStats {
+    pub count: usize,
+    pub total_ms: i64,
+    pub avg_ms: i64,
+    pub median_ms: i64,
+    pub max_ms: i64,
+}
+
+impl DurationStats {
+    pub fn from_samples(mut samples: Vec<i64>) -> DurationStats {
+        if samples.is_empty() {
+            return DurationStats::default();
+        }
+        samples.sort_unstable();
+        let count = samples.len();
+        let total_ms: i64 = samples.iter().map(|&x| x.max(0)).sum();
+        let avg_ms = total_ms / count as i64;
+        let median_ms = if count % 2 == 1 {
+            samples[count / 2].max(0)
+        } else {
+            (samples[count / 2 - 1].max(0) + samples[count / 2].max(0)) / 2
+        };
+        let max_ms = samples.last().copied().unwrap_or(0).max(0);
+        DurationStats { count, total_ms, avg_ms, median_ms, max_ms }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenialStats {
+    pub total: usize,
+    pub by_via: std::collections::BTreeMap<String, usize>,
+    pub waited_after: usize,
+    pub not_waited_after: usize,
+    pub by_path: Vec<PathCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitStats {
+    pub total: usize,
+    pub granted: usize,
+    pub timeout: usize,
+    pub deadlock: usize,
+    pub cancelled: usize,
+    pub active: usize,
+    pub granted_durations: DurationStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCoverage {
+    pub total: usize,
+    /// Already under a `cli` or `grant` lease (directory or file) before editing.
+    pub explicit: usize,
+    /// Acquired automatically via `edit` or `bash`.
+    pub implicit: usize,
+    /// Acquired via `tcas lease wait` before editing.
+    pub waited: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileStats {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub total: usize,
+    pub explicit: usize,
+    pub implicit: usize,
+    pub waited: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirLeaseStats {
+    pub session: String,
+    pub path: String,
+    pub source: String,
+    pub acquired_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_files: Option<usize>,
+    pub modified_files: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestionStats {
+    pub suggested: usize,
+    pub acquired_after: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpfrontStats {
+    pub total: usize,
+    pub with_brief: usize,
+    pub without_brief: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashStats {
+    pub overreach: usize,
+    pub unattributed: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldDurationStats {
+    pub total: usize,
+    pub current: usize,
+    pub durations: DurationStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpiredYieldStats {
+    pub total: usize,
+    pub reacquired: usize,
+    pub explicit_idle: usize,
+    pub explicit_idle_reacquired: usize,
+    pub waited_grace: usize,
+    pub waited_grace_reacquired: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedYieldStats {
+    pub total: usize,
+    pub reacquired_next_turn: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YieldStats {
+    pub expired: ExpiredYieldStats,
+    pub committed_idle: CommittedYieldStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardStats {
+    pub total: usize,
+    pub dynamic: usize,
+    pub by_rule: Vec<RuleCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBlockedStats {
+    pub total: usize,
+    pub missed_by_guard: usize,
+    pub by_user: usize,
+    pub by_hook: Vec<HookCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverrideStats {
+    pub total: usize,
+    pub by_hook: Vec<HookCount>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatsResult {
+    pub workspace_id: String,
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    pub until: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_event_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<i64>,
+    pub events: usize,
+    pub sessions: usize,
+    pub denials: DenialStats,
+    pub waits: WaitStats,
+    pub files: FileCoverage,
+    pub files_by_session: Vec<SessionFileStats>,
+    pub directory_leases: Vec<DirLeaseStats>,
+    pub suggestions: SuggestionStats,
+    pub upfront_acquires: UpfrontStats,
+    pub bash: BashStats,
+    pub orphaned: HoldDurationStats,
+    pub stalled: HoldDurationStats,
+    pub yields: YieldStats,
+    pub guard_blocked: GuardStats,
+    pub git_blocked: GitBlockedStats,
+    pub git_overrides: OverrideStats,
+}

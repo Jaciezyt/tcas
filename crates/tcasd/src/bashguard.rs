@@ -23,6 +23,8 @@ use crate::world::Ws;
 pub struct Refusal {
     pub rule: &'static str,
     pub reason: String,
+    pub ws: Option<String>,
+    pub repo: Option<String>,
 }
 
 /// The checkout a git call acts on.
@@ -85,16 +87,16 @@ fn holders(ls: &[LeaseRow]) -> String {
 }
 
 fn refuse(rule: &'static str, co: &Checkout, others: &[LeaseRow], what: &str, instead: &str) -> Refusal {
+    let shown = co.shown();
     let mut reason = format!(
-        "tcas: {what} is refused in {}: other sessions hold leases there ({}).",
-        co.shown(),
+        "tcas: {what} is refused in {shown}: other sessions hold leases there ({}).",
         holders(others)
     );
     if !instead.is_empty() {
         reason.push('\n');
         reason.push_str(instead);
     }
-    Refusal { rule, reason }
+    Refusal { rule, reason, ws: Some(co.ws.row.id.clone()), repo: Some(shown) }
 }
 
 /// Paths under `dir` (absolute) that `rels` name, as root-relative keys.
@@ -156,11 +158,14 @@ pub fn check(env: &Env, sid: &str, command: &str, cwd: &str) -> R<Option<Refusal
     let on = |dir: &str| checkout_of(env, dir).is_none_or(|c| c.ws.cfg.bash.git_guard);
     for s in &parsed.commands {
         if guard::sets_tcas_allow(s) {
+            let co = checkout_of(env, &s.dir);
             return Ok(Some(Refusal {
                 rule: "tcas_allow",
                 reason: "tcas: TCAS_ALLOW is for the user, to let one of their own git commands through. A session \
                          may not set it. Remove it; if the user should make this change, tell them."
                     .into(),
+                ws: co.as_ref().map(|c| c.ws.row.id.clone()),
+                repo: co.as_ref().map(Checkout::shown),
             }));
         }
         let Some(call) = guard::git_call(s) else { continue };
@@ -194,16 +199,21 @@ fn protected(env: &Env, p: &Parsed) -> Option<Refusal> {
                 return Some(Refusal {
                     rule: "config",
                     reason: crate::text::config_file(&v.tilde(&abs), "part of tcas's own configuration and data"),
+                    ws: None,
+                    repo: None,
                 });
             }
-            if let Some((_, root)) = env.world.root_of(&abs) {
+            if let Some((ws, root)) = env.world.root_of(&abs) {
                 let name = shell::basename(&abs);
                 let is = if root.ci { name.eq_ignore_ascii_case(".tcas.toml") } else { name == ".tcas.toml" };
                 if is {
                     let v = Viewer::new(&env.cwd, env.now);
+                    let co = Path::new(&abs).parent().and_then(|d| checkout_of(env, &fsys::to_str(d)));
                     return Some(Refusal {
                         rule: "config",
                         reason: crate::text::config_file(&v.path(&abs, false), "tcas's configuration for this workspace"),
+                        ws: Some(ws.row.id.clone()),
+                        repo: co.as_ref().map(Checkout::shown),
                     });
                 }
             }
@@ -247,14 +257,18 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
                 let dirty = engine::dirty_of(env, co.ws, &hit);
                 let hit: Vec<&LeaseRow> =
                     hit.into_iter().filter(|l| dirty.contains(&(l.root.clone(), l.path_key.clone()))).collect();
-                (!hit.is_empty()).then(|| Refusal {
-                    rule: "add_dir",
-                    reason: format!(
-                        "tcas: git add of a directory is refused in {}: it holds files other sessions are changing:\n{}\n\
-                         Add only the files you changed:  git add <path>…   or commit them with:  tcas commit -m \"…\"",
-                        co.shown(),
-                        path_list(env, &co, &hit)
-                    ),
+                (!hit.is_empty()).then(|| {
+                    let shown = co.shown();
+                    Refusal {
+                        rule: "add_dir",
+                        reason: format!(
+                            "tcas: git add of a directory is refused in {shown}: it holds files other sessions are changing:\n{}\n\
+                             Add only the files you changed:  git add <path>…   or commit them with:  tcas commit -m \"…\"",
+                            path_list(env, &co, &hit)
+                        ),
+                        ws: Some(co.ws.row.id.clone()),
+                        repo: Some(shown),
+                    }
                 })
             }
             Action::CommitAll => Some(refuse(
@@ -283,16 +297,20 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
                     })
                     .cloned()
                     .collect();
-                (!foreign.is_empty()).then(|| Refusal {
-                    rule: "commit_staged",
-                    reason: format!(
-                        "tcas: git commit without paths is refused in {}: the index holds files that are not under \
-                         this session's leases ({}), and other sessions are working there ({}). Commit only your own \
-                         files:  tcas commit -m \"…\"",
-                        co.shown(),
-                        foreign.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-                        holders(&others)
-                    ),
+                (!foreign.is_empty()).then(|| {
+                    let shown = co.shown();
+                    Refusal {
+                        rule: "commit_staged",
+                        reason: format!(
+                            "tcas: git commit without paths is refused in {shown}: the index holds files that are not under \
+                             this session's leases ({}), and other sessions are working there ({}). Commit only your own \
+                             files:  tcas commit -m \"…\"",
+                            foreign.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                            holders(&others)
+                        ),
+                        ws: Some(co.ws.row.id.clone()),
+                        repo: Some(shown),
+                    }
                 })
             }
             Action::CommitPaths(_) => None,
@@ -317,14 +335,18 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
                     !mine.iter().any(|l| l.workspace == co.ws.row.id && l.root == co.root && lease::covers(&l.path_key, l.is_prefix, k, *is_dir))
                 });
                 let hit = overlapping(&others, &keys);
-                outside_mine.then(|| Refusal {
-                    rule: "restore",
-                    reason: format!(
-                        "tcas: restoring these paths is refused in {}: they cover files that are not under this \
-                         session's leases{}.\nRestore only paths you hold:  git restore <path>…",
-                        co.shown(),
-                        if hit.is_empty() { String::new() } else { format!(":\n{}", path_list(env, &co, &hit)) }
-                    ),
+                outside_mine.then(|| {
+                    let shown = co.shown();
+                    Refusal {
+                        rule: "restore",
+                        reason: format!(
+                            "tcas: restoring these paths is refused in {shown}: they cover files that are not under this \
+                             session's leases{}.\nRestore only paths you hold:  git restore <path>…",
+                            if hit.is_empty() { String::new() } else { format!(":\n{}", path_list(env, &co, &hit)) }
+                        ),
+                        ws: Some(co.ws.row.id.clone()),
+                        repo: Some(shown),
+                    }
                 })
             }
             Action::Discard => Some(refuse("discard", &co, &others, "git checkout -f / switch --discard-changes", TELL_USER)),
@@ -430,7 +452,11 @@ fn worktree_target(env: &Env, sid: &str, from: &Checkout, target: &str, call: &G
 
 /// Records a refusal.
 pub fn record(env: &Env, sid: &str, r: &Refusal, command: &str) -> R<()> {
-    let ws = env.world.by_cwd(&env.cwd).map(|w| w.row.id.clone());
+    let ws = r.ws.clone().or_else(|| env.world.by_cwd(&env.cwd).map(|w| w.row.id.clone()));
     let one: String = command.chars().take(500).collect();
-    env.event(ws.as_deref(), Some(sid), "bash.blocked", json!({ "rule": r.rule, "command": one }))
+    let mut payload = json!({ "rule": r.rule, "command": one });
+    if let Some(repo) = &r.repo {
+        payload["repo"] = json!(repo);
+    }
+    env.event(ws.as_deref(), Some(sid), "bash.blocked", payload)
 }

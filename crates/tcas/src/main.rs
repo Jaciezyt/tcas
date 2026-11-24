@@ -7,6 +7,7 @@ mod githook;
 mod hook;
 mod out;
 mod plugin;
+mod stats;
 
 use std::time::Duration;
 
@@ -65,6 +66,20 @@ enum Cmd {
         /// Events of every workspace.
         #[arg(long)]
         all: bool,
+    },
+    /// Usage and contention statistics from the event log.
+    Stats {
+        /// Start of the time window (e.g. `7d`, `24h`, `30m`, `2026-11-20`, `all`).
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (e.g. `2026-11-25`, `1h`).
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to one checkout in the workspace.
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Start, stop or inspect tcasd.
     #[command(subcommand)]
@@ -352,6 +367,10 @@ fn run(x: &Ctx, cmd: Cmd) -> Result<i32, i32> {
         Cmd::Log { n, follow, session, path, workspace, all } => {
             let base = json!({ "n": n, "session": session, "path": path, "workspace": workspace, "all": all });
             log(x, base, follow)?
+        }
+        Cmd::Stats { since, until, repo, workspace } => {
+            let v = x.call("stats", json!({ "since": since, "until": until, "repo": repo, "workspace": workspace }))?;
+            x.emit(v, stats::print)
         }
         Cmd::Daemon(d) => daemon(x, d)?,
         Cmd::Doctor => doctor::run(x),

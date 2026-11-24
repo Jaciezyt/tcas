@@ -4,6 +4,7 @@ pub mod git;
 pub mod hook;
 pub mod info;
 pub mod lease;
+pub mod stats;
 pub mod workspace;
 
 use std::collections::HashSet;
@@ -36,6 +37,7 @@ pub fn dispatch(d: &'static Daemon, req: Request, stream: &UnixStream) -> Respon
     let out = match req.op.as_str() {
         "lease.wait" => lease::wait(d, &req, stream),
         "daemon.stop" => info::daemon_stop(d, &req),
+        "stats" => stats::handle(d, &req),
         op => {
             let op = op.to_string();
             with_tx(d, &req, |env| match op.as_str() {
@@ -119,7 +121,7 @@ pub fn with_tx_inner_freed<T>(
     let cwd = canonical_cwd(&req.cwd);
     let caller = identify(&tx, &d.home, req.session.as_deref(), &req.ancestors, &cwd.to_string_lossy(), now)?;
     let world = World::load(&tx)?;
-    let mut env = Env { d, c: &tx, world, g, now, caller, cwd, waiting, freed: Default::default() };
+    let mut env = Env { d, c: &tx, world, g, now, caller, agent: None, cwd, waiting, freed: Default::default() };
     let changed = housekeeping(&mut env)?;
     let v = f(&mut env)?;
     if changed || reread || req.op.starts_with("workspace.") || req.op.starts_with("exempt.") {

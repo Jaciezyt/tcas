@@ -63,6 +63,10 @@ impl Waits {
         out
     }
 
+    pub fn active_snapshot(&self) -> Vec<(String, String, Vec<String>)> {
+        self.list.iter().map(|w| (w.ws.clone(), w.session.clone(), w.wanted.clone())).collect()
+    }
+
     pub fn remove(&mut self, id: u64) -> Option<WaitEntry> {
         let i = self.list.iter().position(|w| w.id == id)?;
         Some(self.list.remove(i))
@@ -199,6 +203,7 @@ fn attempt(d: &Daemon, w: &WaitEntry, now: i64) -> R<Attempt> {
         g: d.global(),
         now,
         caller: Caller::Session(w.session.clone()),
+        agent: None,
         cwd: w.cwd.clone(),
         waiting: HashMap::new(),
         freed: Default::default(),
@@ -245,7 +250,11 @@ pub fn last_commit(d: &Daemon, abs: &str) -> Option<String> {
 
 fn finish(d: &Daemon, w: &WaitEntry, r: AcquireResult, kind: &str) {
     let now = tcas_sys::clock::now_ms();
-    let paths: Vec<String> = r.wanted.iter().map(|p| p.display.clone()).collect();
+    let paths: Vec<String> = if r.wanted.is_empty() {
+        w.wanted.clone()
+    } else {
+        r.wanted.iter().map(|p| p.display.clone()).collect()
+    };
     let mut payload = json!({ "paths": paths, "waited_ms": now - w.started_at });
     if kind == "wait.deadlock" {
         payload["cycle"] = serde_json::to_value(&r.cycle).unwrap_or_default();

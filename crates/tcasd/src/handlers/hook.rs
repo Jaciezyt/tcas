@@ -27,6 +27,7 @@ pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
         return Err(Fail::bad("hook: the harness and the session are required"));
     }
     let sid = h.session_id();
+    env.agent = h.agent.clone();
     let res = if h.event == "session_end" {
         session_end(env, &sid, &h)?;
         HookResponse::default()
@@ -243,8 +244,16 @@ fn session_end(env: &mut Env, sid: &str, h: &HookRequest) -> R<()> {
             let dirty = engine::dirty_of(env, &ws, &ls);
             for l in ls {
                 if dirty.contains(&(l.root.clone(), l.path_key.clone())) {
+                    if let Some(since) = l.stalled_at {
+                        env.event(
+                            Some(&l.workspace),
+                            Some(sid),
+                            "lease.unstalled",
+                            json!({ "root": l.root, "path": l.path, "stalled_ms": (env.now - since).max(0), "reason": "orphaned" }),
+                        )?;
+                    }
                     env.c.execute(
-                        "UPDATE lease SET state='orphaned' WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                        "UPDATE lease SET state='orphaned', stalled_at=NULL WHERE workspace=?1 AND root=?2 AND path_key=?3",
                         params![l.workspace, l.root, l.path_key],
                     )?;
                     env.event(Some(&l.workspace), Some(sid), "lease.orphaned", json!({ "root": l.root, "path": l.path }))?;
@@ -279,7 +288,7 @@ fn stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     reconcile::close_foreground(env, sid, None, &mut rep)?;
     reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?;
     env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND background_id IS NULL", [sid])?;
-    env.c.execute("UPDATE session SET state='idle' WHERE id=?1 AND state!='ended'", [sid])?;
+    env.c.execute("UPDATE session SET state='idle', turn=turn+1 WHERE id=?1 AND state!='ended'", [sid])?;
     Ok(HookResponse::default())
 }
 
@@ -456,6 +465,7 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
         }
         match t.kind.as_str() {
             "edit" if !t.failed => {
+                engine::mark_edited(env, sid, &t.paths, "edit")?;
                 extra.extend(outside(env, sid, t)?);
                 extra.extend(suggest_acquire(env, sid, t)?);
             }

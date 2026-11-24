@@ -38,6 +38,14 @@ pub fn check(d: &'static Daemon) {
             }
         }
     }
+    let waiting = d.waits().summary();
+    let req = Request { v: tcas_core::proto::VERSION, op: "internal.stalled".into(), session: None, cwd: "/".into(), ancestors: vec![], args: serde_json::Value::Null };
+    let _ = handlers::with_tx_inner(d, &req, waiting, |env| {
+        for ws in env.world.wss.clone() {
+            engine::sync_stalled(env, &ws)?;
+        }
+        Ok(())
+    });
     let now = tcas_sys::clock::now_ms();
     let retention = d.global().cfg.daemon.event_retention_days as i64 * 86_400_000;
     let conn = d.db();

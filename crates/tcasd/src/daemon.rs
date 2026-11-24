@@ -281,6 +281,7 @@ pub fn seen(c: &Connection, home: &Home, sid: &str, s: &Seen, now: i64) -> R<Opt
                 "UPDATE session SET last_seen_at=?2, pid=COALESCE(?3, pid), pid_started_at=COALESCE(?4, pid_started_at) WHERE id=?1",
                 rusqlite::params![sid, now, pid, pid_at],
             )?;
+            clear_stalled_for_session(c, sid, now)?;
         }
         Some(row) => {
             c.execute(
@@ -288,6 +289,7 @@ pub fn seen(c: &Connection, home: &Home, sid: &str, s: &Seen, now: i64) -> R<Opt
                  pid=COALESCE(?4, pid), pid_started_at=COALESCE(?5, pid_started_at) WHERE id=?1",
                 rusqlite::params![sid, now, s.cwd, pid, pid_at],
             )?;
+            clear_stalled_for_session(c, sid, now)?;
             if row.state == "ended" {
                 store::event(c, now, None, Some(sid), "session.resumed", json!({ "cwd": s.cwd, "via": s.via }))?;
                 readopt(c, sid, now)?;
@@ -296,6 +298,26 @@ pub fn seen(c: &Connection, home: &Home, sid: &str, s: &Seen, now: i64) -> R<Opt
         }
     }
     Ok(store::session(c, sid)?)
+}
+
+fn clear_stalled_for_session(c: &Connection, sid: &str, now: i64) -> R<()> {
+    for l in store::leases_session(c, sid)? {
+        if let Some(since) = l.stalled_at {
+            c.execute(
+                "UPDATE lease SET stalled_at=NULL WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                rusqlite::params![l.workspace, l.root, l.path_key],
+            )?;
+            store::event(
+                c,
+                now,
+                Some(&l.workspace),
+                Some(sid),
+                "lease.unstalled",
+                json!({ "root": l.root, "path": l.path, "stalled_ms": (now - since).max(0), "reason": "active" }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Orphaned leases of a session that is back become active again.
