@@ -88,6 +88,8 @@ impl<'a> S<'a> {
             .env("TCAS_HOOK_PID", self.proc.id().to_string())
             .env_remove("TCAS_SESSION")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT")
             .env_remove("TCAS_DISABLE")
             .env_remove("CLAUDE_ENV_FILE")
             .stdin(Stdio::piped())
@@ -205,6 +207,8 @@ impl<'a> S<'a> {
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT")
             .env_remove("TCAS_ALLOW")
             .stdin(Stdio::null());
         c

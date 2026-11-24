@@ -1,0 +1,7 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "tcas",
+  "displayName": "TCAS",
+  "version": "0.1.0",
+  "description": "Leases on files and directories, so several coding agent sessions can share a checkout without overwriting each other's work."
+}

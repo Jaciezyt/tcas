@@ -595,7 +595,7 @@ Claude Code 2.1.327，macOS，无界面模式（`claude -p`），plugin 用 `--p
 | 编辑失败（要替换的文本不存在）触发哪个事件 | 两个事件都挂了 hook，另有 `Stop` 兜底 |
 | `NotebookEdit` 的路径字段名（文档里是 `notebook_path`） | 改适配层 |
 | harness 被强杀时不触发 `SessionEnd` | 靠 tcasd 的进程检查，已在设计里 |
-| 交互模式、AGY 和 Codex 下，Bash 命令的祖先进程里是否同样有 harness 进程 | 没有的话只靠环境变量认会话 |
+| Codex 下，Bash 命令的祖先进程里是否同样有 harness 进程 | 没有的话只靠环境变量认会话 |
 | brief 相关的行为在别的模型、多次运行下是否稳定（每种情况只用 haiku 跑了一次） | 统计里看被拒之后去等、换做法、告诉用户各占多少；调整拒绝理由的措辞 |
 | 后台等待结束后，命令的输出会话读不到（实测两次，会话都说读不到输出文件） | 已经靠 hook 注入结果；实现后确认注入的内容在这种情况下到达 |
 | 别的 git 版本是否支持配置式钩子（只在 2.54.0 上测过） | 安装时实际试一次；不支持就不装，或改为往 `.git/hooks/` 里放转发脚本 |
@@ -611,42 +611,39 @@ Claude Code 2.1.327，macOS，无界面模式（`claude -p`），plugin 用 `--p
 
 ## 10. AGY
 
-已知的（本机 `agy 1.5.16` 及 AGY 插件与 hook 规范）：
+已实测并接入（本机 `agy 1.5.16`，完整探针数据见 `tests/probe/RESULTS.md`）：
 
 - **Plugin 目录结构**：原生 plugin 放在 `plugins/agy/`（安装后在 `~/.gemini/config/plugins/tcas/`），根目录下直接放 `plugin.json` 和 **`hooks.json`**（原生 plugin 不做扩展目录搬运，`hooks.json` 必须在 plugin 根目录，不能放在 `hooks/hooks.json`），外加 `bin/tcas` 转发脚本与 `skills/tcas/SKILL.md`。
-- **安装与开关**：`agy plugin install <目录>` 直接从本地目录安装，`agy plugin validate <目录>` 校验清单；启停状态记在 `~/.gemini/config/config.json` 的 `plugins.tcas.enabled`（可用 `agy plugin enable/disable tcas` 切换）。开发时也可以在工作区的 `.agents/plugins.json` 里直接登记目录。
-- **hook 运行环境**：hook 命令由 `sh -c` 启动，工作目录固定是 `hooks.json` 所在的目录（即 plugin 根目录），环境里带 `PLUGIN_ROOT` 和 `PLUGIN_DATA`；命令写 `"./bin/tcas hook agy"`。agent 的当前工作目录从输入 JSON 的 `cwd` 字段读，不能取 hook 进程自己的 `pwd`。
+- **安装与开关**：`agy plugin install <目录>` 直接从本地目录安装，`agy plugin validate <目录>` 校验清单；启停状态记在 `~/.gemini/config/config.json` 的 `plugins.tcas.enabled`（可用 `agy plugin enable/disable tcas` 切换）。开发时也可以在未受 `.gitignore` 排除的工作区 `.agents/plugins/` 下放置目录（交互模式下首次进入需确认信任目录）。plugin 的 `bin/` **不会**进入 `run_command` 的 `PATH`，`tcas` 需在用户 `PATH`（如 `~/.tcas/bin`）中，`tcas doctor` 对此做检查。
+- **hook 运行环境**：hook 命令由 `sh -c` 启动，工作目录固定是 `hooks.json` 所在的目录（即 plugin 根目录），环境里带 `PLUGIN_ROOT` 和 `PLUGIN_DATA`；命令写 `"exec ./bin/tcas hook agy"`（用 `exec` 省去中间 `sh` 进程，使 `getppid()` 直接拿到随会话退出的 `agy` 进程）。agent 的当前工作目录从输入 JSON 的 `cwd` 字段读，不能取 hook 进程自己的 `pwd`；工具参数里的路径未做符号链接展开（如 `/tmp/…`），统一经 `fsys::normalize` 规范化。
 - **事件与输入输出格式**（标准输入进、标准输出出，字段全部 camelCase）：
   - 公共输入字段：`conversationId`、`cwd`、`workspacePaths`、`transcriptPath`、`artifactDirectoryPath`、`lastUserInput`、`hookEventName`。
-  - `SessionStart`：会话开始时触发一次；输出 `{"injectSteps": [{"systemMessage": {"systemMessage": "…"}}]}` 注入 workspace 说明与状态。
-  - `PreInvocation`：每次调用模型前触发；从 `lastUserInput` 取首条用户消息作会话标题，用 `injectSteps` 投递待发通知（让出的通知排在最前）。
-  - `PreToolUse`：输入 `toolCall`（`id`、`name`、`args`）。工具名由内部 step 类型去掉 `CORTEX_STEP_TYPE_` 前缀并转小写得来（如命令工具 `run_command`，读文件 `view_file`，写/改文件 `write_to_file`、`replace_file_content`、`multi_replace_file_content` 等）。输出 `{"decision": "allow" | "deny", "reason": "…", "overwrite": {…}}`。
-  - `PostToolUse`：输入同上，失败时带 `"error"` 字段。**输出固定是空对象 `{}`，不能直接注入上下文**；因此编辑提醒、读取提示和 Bash 对账提示先写入会话的通知队列，紧接着由同轮的 `PostInvocation` 投递。
+  - `SessionStart`：新建会话开始时触发一次；输出 `{"injectSteps": [{"systemMessage": {"systemMessage": "…"}}]}` 注入 workspace 说明与状态。
+  - `PreInvocation`：每次调用模型前触发；从 `lastUserInput` 取首条用户消息作会话标题，用 `injectSteps` 投递待发通知（让出的通知排在最前）。**续接会话（`agy -r` / `--conversation`）不触发 `SessionStart`，首条事件就是 `PreInvocation`**；`tcasd` 在 `ended` 会话重新活动时清掉已注入标记，由这次 `PreInvocation` 重新注入说明与接回的遗留租约。
+  - `PreToolUse`：输入 `toolCall`（`id`、`name`、`args`）。`agy 1.5.16` 实测工具名为 `edit_file`、`write_file`、`read_file`（路径均在 `args.Path`）和 `run_command`（命令在 `args.CommandLine`，等待毫秒数在 `args.WaitMsBeforeAsync`），同时兼容旧 Cortex 名称（`view_file`、`write_to_file`、`replace_file_content`、`multi_replace_file_content`）。输出 `{"decision": "allow" | "deny", "reason": "…", "overwrite": {…}}`；**不介入放行时输出 0 字节空标准输出并以 0 退出**（在 `PreToolUse` 上输出 `{}` 会被 AGY 当作非法响应而拦截）。
+  - `PostToolUse`：输入同上，带 `"error"` 字段（成功以及命令非零退出时均为 `""` 空串，工具自身报错时非空）。**输出固定是空对象 `{}`，不能直接注入上下文**；因此编辑提醒、读取提示和 Bash 对账提示先写入会话的通知队列（`defer_context: true`），紧接着由同轮的 `PostInvocation`（或后台唤醒时的 `PreInvocation`）投递。
   - `PostInvocation`：一轮工具调用结束后触发；输出 `injectSteps` 把待发通知和刚产生的提示一次注入给模型。
   - `Stop`：执行循环结束时触发，输入带 `terminationReason`、`fullyIdle`（后台任务是否全部结束）、`continuationActive`；正常放行停止时输出 `{}`（`decision: "continue"` 会阻止停止并强制继续，不能在普通收尾时返回）。
-  - **没有 `SessionEnd` 事件，也没有配置级的 `onFailure: "block"`**。
-- **会话身份**：`run_command` 启动的子进程环境里本来就带 `ANTIGRAVITY_CONVERSATION_ID`，值与 hook 输入的 `conversationId` 相同（另带 `ANTIGRAVITY_AGENT` 等变量），不需要额外写环境文件。`tcas` 客户端在 `TCAS_SESSION`、`CLAUDE_CODE_SESSION_ID` 之外读 `ANTIGRAVITY_CONVERSATION_ID`，会话 ID 记作 `agy:<conversationId>`。
-- **后台等待与改写**：`run_command` 没有布尔型的 `run_in_background`，而是靠 `WaitMsBeforeAsync`（毫秒，后台运行的命令设 `500`）；超时未退出的命令自动转入后台任务，结束时系统唤醒空闲会话。`PreToolUse` 遇到单条 `tcas lease wait` 且 `WaitMsBeforeAsync` 未设或大于 `500` 时，返回 `{"decision": "allow", "overwrite": {"WaitMsBeforeAsync": 500}}` 把它改成后台运行。
+  - **没有 `SessionEnd` 事件**。
+- **会话身份、进程生命周期与子 agent**：
+  - `run_command` 启动的子进程环境里自带 `ANTIGRAVITY_CONVERSATION_ID`，值与 hook 输入的 `conversationId` 相同。`tcas` 客户端按 `TCAS_SESSION` -> `CLAUDE_CODE_SESSION_ID` -> `ANTIGRAVITY_CONVERSATION_ID` 取身份，会话 ID 记作 `agy:<conversationId>`。
+  - 无界面 `agy -p` 下，所有 hook 的父进程就是该次 `agy` CLI 进程；交互 TUI 下，TUI 启动一个会话私有的子 `agy` language-server 进程作为所有 hook 与 `run_command` 的共同祖先，且 TUI 退出时该子进程立即退出。即使 `env -u ANTIGRAVITY_CONVERSATION_ID` 或开启 `--sandbox`，`run_command` 的进程祖先链里也包含该会话进程，因此进程存活检查与身份回溯在两种模式下都成立。
+  - `invoke_subagent` 启动的子 agent 运行在同一个 `agy` 进程内（`(pid, started_at)` 与父会话一致），但拥有独立的 `conversationId`，且其所有 hook 的 `lastUserInput` 恒为空串 `""`。`tcasd` 据此把同一存活进程下的子 agent 会话映射到父会话（`session_alias`），共享父会话的租约，子 agent 的 `Stop` 只做 `agent_stop` 而不结束父会话的一轮。
+- **后台等待、改写与窗口保留**：
+  - `run_command` 靠 `WaitMsBeforeAsync`（毫秒，后台设 `500`）控制前后台。`PreToolUse` 遇到单条前台 `tcas lease wait`（`WaitMsBeforeAsync` 未设或大于 `500`）时，返回 `{"decision": "allow", "overwrite": {"WaitMsBeforeAsync": 500}}` 把它改成后台运行（注意不能在 `overwrite` 里写 `BypassSandbox: true`，否则 AGY 会强制弹人工确认）。
+  - 与 Claude Code 不同，AGY 的命令在 ~500ms 转入后台时**不会立刻触发 `PostToolUse`**：模型先收到返回并结束当前轮（触发 `Stop(fullyIdle: false)`），等到后台命令真正退出时才触发 `PostToolUse`，随后自动触发唤醒轮的 `PreInvocation` -> 模型回复 -> `PostInvocation` -> `Stop(fullyIdle: true)`。因此 `Stop(fullyIdle: false)`（`keep_background: true`）不会把进行中的 `run_command` 对账窗口丢弃，而是提升为 `bg:<call_id>` 留到命令退出时的 `PostToolUse` 再对账。
+- **失败即拒绝与权限模式**：实测 `PreToolUse` 上非零退出码、超时、非法 JSON、`{}` 和程序缺失在 AGY 中默认都是拦截（fail-closed）；`bin/tcas`（找不到 `tcas` 且存在活跃 workspace 时）和 `tcas hook agy` 仍显式在出错分支输出 `{"decision": "deny", "reason": "…"}` 给出可读原因。`--dangerously-skip-permissions` 与 `--sandbox` 模式下 `PreToolUse` 均照常触发并执行 `deny`。
 - **豁免目录**：内置豁免列表包含 `~/.gemini`（全局配置、已安装插件、`~/.gemini/antigravity-cli/brain/<会话>/` 下的 artifact、scratch 脚本、任务日志和 transcript 都在这里）。
 
-适配要做的事：
+实测与实现对照：
 
-| 项目 | 做法 |
+| 项目 | 实测结论与做法 |
 |---|---|
-| 接入 | `plugins/agy/`（`plugin.json`、根目录 `hooks.json`、`bin/tcas`、按 AGY 工具名调整的 `skills/tcas/SKILL.md`）；`tcas plugin install agy` 写入 `~/.tcas/plugins/tcas/` 并调用 `agy plugin install`；`tcas doctor` 检查 `agy` 版本与插件启用状态 |
-| 编辑与读取拦截 | `PreToolUse` / `PostToolUse` 匹配编辑与读取工具，转成 `HookRequest`；`PostToolUse` 产生的上下文写入通知队列，由紧随其后的 `PostInvocation` 用 `injectSteps` 注入 |
-| 命令（`run_command`） | 命令护栏、对账与 Claude Code 相同；批准可用的 `tcas` 子命令，并用 `overwrite.WaitMsBeforeAsync = 500` 把前台 `tcas lease wait` 改成后台运行 |
-| 失败即拒绝 | 没有 `onFailure: "block"`，`bin/tcas` 和 `tcas hook agy` 自己兜住所有出错和超时分支，在 `PreToolUse` 上输出 `{"decision": "deny", "reason": "…"}` |
-| 会话身份与结束 | 身份取 `conversationId` / `ANTIGRAVITY_CONVERSATION_ID`；续接（`agy -c` / `--conversation`）保持同一 ID 自动接回遗留租约；结束靠进程检查（见下） |
-
-开工前先用探针（`agy -p`）实测确认：
-
-1. 各编辑、读取、搜索工具在 `PreToolUse` / `PostToolUse` 里实际的 `toolCall.name` 和路径参数字段名。
-2. hook 进程非零退出、超时或输出非法 JSON 时，AGY 默认是放行还是拦截。
-3. hook 的父进程与 `run_command` 的祖先链：AGY 有 CLI 进程和后台 language server（环境里有 `ANTIGRAVITY_LS_ADDRESS`），需确认哪一个是随会话退出的进程；若父进程是跨会话常驻的 language server，则不能直接拿它的 PID 判会话结束。
-4. `invoke_subagent` 启动的子 agent 触发 hook 时，`conversationId` 是父会话还是独立的新 ID，以及能否关联回父会话。
-5. `WaitMsBeforeAsync: 500` 后台运行 `tcas lease wait` 结束后的唤醒事件顺序，以及 `PreInvocation` / `PostInvocation` 的 `injectSteps` 在无界面和交互模式下能否稳定送达模型。
-6. plugin 的 `bin/` 是否进入 `run_command` 的 `PATH`（不进则说明 `tcas` 需在用户 `PATH` 或 `~/.tcas/bin` 中），以及 `--dangerously-skip-permissions`、`--sandbox` 模式下 hook 是否照常触发。
+| 接入 | `plugins/agy/`（`plugin.json`、根目录 `hooks.json`、`bin/tcas`、`skills/tcas/SKILL.md`）；`tcas plugin install agy` 写入 `~/.tcas/plugins/tcas/` 并调用 `agy plugin install`（已禁用时自动 `enable`）；`tcas doctor` 检查 `agy`、插件状态与 `tcas` 是否在 `PATH` |
+| 编辑与读取拦截 | 匹配 `edit_file` / `write_file` / `read_file` 及旧 Cortex 工具名；放行走 0 字节输出；`PostToolUse` 提示通过 `defer_context` 排入通知队列，由紧随其后的 `PostInvocation` / `PreInvocation` 用 `injectSteps` 注入 |
+| 命令（`run_command`） | 命令护栏与 Claude Code 相同；批准可用的 `tcas` 子命令；`overwrite.WaitMsBeforeAsync = 500` 改写前台 `tcas lease wait`；`Stop(fullyIdle: false)` 保留后台命令对账窗口直到进程退出时的 `PostToolUse` |
+| 失败即拒绝 | AGY 自身对异常退出/超时默认拦截，`bin/tcas` 与 `tcas hook agy` 另在错误分支显式输出 `{"decision": "deny", "reason": "…"}` |
+| 会话身份、续接与子 agent | 身份取 `conversationId` / `ANTIGRAVITY_CONVERSATION_ID`（及祖先进程回溯）；`agy -r` 在首个 `PreInvocation` 接回遗留租约并补发说明；同进程 `lastUserInput == ""` 的 `invoke_subagent` 自动归入父会话 |
 
 ## 11. Codex
 

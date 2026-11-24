@@ -577,6 +577,13 @@ fn wait_result(r: &AcquireResult) -> String {
 /// One notice other than `lease.yielded`.
 pub fn notice(kind: &str, b: &Value) -> Option<String> {
     Some(match kind {
+        "hint" => {
+            let t = s(b, "text");
+            if t.is_empty() {
+                return None;
+            }
+            t.to_string()
+        }
         "wait.granted" | "wait.timeout" | "wait.deadlock" => {
             let r: AcquireResult = serde_json::from_value(b.get("result")?.clone()).ok()?;
             wait_result(&r)

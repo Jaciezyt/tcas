@@ -209,7 +209,12 @@ pub fn identify(
     now: i64,
 ) -> R<Caller> {
     let sid = match session.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => Some(s.to_string()),
+        Some(s) => {
+            let aliased: Option<String> = c
+                .query_row("SELECT parent FROM session_alias WHERE alias=?1", [s], |r| r.get(0))
+                .ok();
+            Some(aliased.unwrap_or_else(|| s.to_string()))
+        }
         None => {
             // The newest live session of the nearest registered ancestor
             // (after /clear the process also has the ended session before it).
@@ -291,6 +296,7 @@ pub fn seen(c: &Connection, home: &Home, sid: &str, s: &Seen, now: i64) -> R<Opt
             )?;
             clear_stalled_for_session(c, sid, now)?;
             if row.state == "ended" {
+                let _ = c.execute("DELETE FROM session_ws WHERE session=?1", [sid]);
                 store::event(c, now, None, Some(sid), "session.resumed", json!({ "cwd": s.cwd, "via": s.via }))?;
                 readopt(c, sid, now)?;
                 mark(home, sid);

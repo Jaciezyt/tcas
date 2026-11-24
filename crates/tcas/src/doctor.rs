@@ -27,6 +27,12 @@ const CLAUDE_TESTED_MIN: (u64, u64, u64) = (2, 1, 327);
 const CLAUDE_TESTED_MAX: (u64, u64, u64) = (2, 1, 331);
 const CLAUDE_TESTED_RANGE: &str = "2.1.327 - 2.1.331";
 
+const AGY_MIN_VERSION: (u64, u64, u64) = (1, 5, 16);
+const AGY_MIN_STR: &str = "1.5.16";
+const AGY_TESTED_MIN: (u64, u64, u64) = (1, 5, 16);
+const AGY_TESTED_MAX: (u64, u64, u64) = (1, 5, 16);
+const AGY_TESTED_RANGE: &str = "1.5.16";
+
 #[derive(Serialize)]
 struct DaemonSection {
     running: bool,
@@ -79,6 +85,30 @@ struct ClaudeSection {
 }
 
 #[derive(Serialize)]
+struct AgySection {
+    installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    minimum_version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meets_minimum: Option<bool>,
+    tested_range: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tested: Option<bool>,
+    plugin_dir: String,
+    plugin_files_ok: bool,
+    plugin_installed: bool,
+    plugin_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_hooks_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_bin_executable: Option<bool>,
+    tcas_on_path: bool,
+}
+
+#[derive(Serialize)]
 struct DoctorReport {
     cli_version: &'static str,
     protocol_version: u32,
@@ -89,6 +119,7 @@ struct DoctorReport {
     workspace: Option<DoctorWorkspace>,
     git: GitSection,
     claude: ClaudeSection,
+    agy: AgySection,
 }
 
 fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
@@ -143,6 +174,43 @@ fn claude_info(x: &Ctx) -> ClaudeSection {
         plugin_enabled: st.plugin_enabled,
         installed_version: st.installed_version,
         cache_bin_executable: st.cache_bin_executable,
+    }
+}
+
+fn tcas_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| plugin::is_executable(&d.join("tcas"))))
+        .unwrap_or(false)
+}
+
+fn agy_info(x: &Ctx) -> AgySection {
+    let out = Command::new("agy").arg("--version").stdin(Stdio::null()).output();
+    let (installed, version, ver_tuple) = match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let ver = s.split_whitespace().next().unwrap_or("").to_string();
+            let parsed = parse_semver(&s);
+            let shown = if ver.is_empty() { s } else { ver };
+            (true, Some(shown), parsed)
+        }
+        _ => (false, None, None),
+    };
+    let st = plugin::agy_state(&x.c.home);
+    AgySection {
+        installed,
+        version,
+        minimum_version: AGY_MIN_STR,
+        meets_minimum: ver_tuple.map(|v| v >= AGY_MIN_VERSION),
+        tested_range: AGY_TESTED_RANGE,
+        tested: ver_tuple.map(|v| v >= AGY_TESTED_MIN && v <= AGY_TESTED_MAX),
+        plugin_dir: fsys::to_str(&st.plugin_dir),
+        plugin_files_ok: st.plugin_files_ok,
+        plugin_installed: st.plugin_installed,
+        plugin_enabled: st.plugin_enabled,
+        installed_version: st.installed_version,
+        installed_hooks_ok: st.installed_hooks_ok,
+        installed_bin_executable: st.installed_bin_executable,
+        tcas_on_path: tcas_on_path(),
     }
 }
 
@@ -282,6 +350,7 @@ pub fn run(x: &Ctx) -> i32 {
     let git = git_info();
     let tcas_git = tcasd::git::Git::new();
     let claude = claude_info(x);
+    let agy = agy_info(x);
 
     let cli_version = env!("CARGO_PKG_VERSION");
     let home_str = fsys::to_str(&x.c.home.dir);
@@ -390,6 +459,7 @@ pub fn run(x: &Ctx) -> i32 {
         workspace,
         git,
         claude,
+        agy,
     };
 
     if x.json {
@@ -492,6 +562,54 @@ fn print_human(x: &Ctx, r: &DoctorReport) {
         && !exec
     {
         println!("  warning: cached bin/tcas is not executable; reinstall with: tcas plugin install claude");
+    }
+
+    println!();
+    if r.agy.installed {
+        let min_s = match r.agy.meets_minimum {
+            Some(true) => "ok",
+            Some(false) => "TOO OLD",
+            None => "unknown",
+        };
+        let test_s = match r.agy.tested {
+            Some(true) => "yes",
+            Some(false) => "untested",
+            None => "unknown",
+        };
+        println!(
+            "agy        {} (minimum {}: {min_s}; tested {}: {test_s})",
+            r.agy.version.as_deref().unwrap_or("?"),
+            r.agy.minimum_version,
+            r.agy.tested_range
+        );
+    } else {
+        println!("agy        not found on PATH");
+    }
+    println!(
+        "  plugin files ({}): {}",
+        x.o.tilde(&r.agy.plugin_dir),
+        if r.agy.plugin_files_ok { "ok" } else { "missing or incomplete" }
+    );
+    let agy_inst = match (r.agy.plugin_installed, r.agy.plugin_enabled) {
+        (true, true) => {
+            let v = r.agy.installed_version.as_deref().unwrap_or("?");
+            format!("installed ({v}), enabled")
+        }
+        (true, false) => {
+            let v = r.agy.installed_version.as_deref().unwrap_or("?");
+            format!("installed ({v}), DISABLED")
+        }
+        (false, _) => "not installed (run: tcas plugin install agy)".into(),
+    };
+    println!("  installed (tcas): {agy_inst}");
+    if r.agy.installed_hooks_ok == Some(false) {
+        println!("  warning: installed plugin is missing root hooks.json; reinstall with: tcas plugin install agy");
+    }
+    if r.agy.installed_bin_executable == Some(false) {
+        println!("  warning: installed bin/tcas is not executable; reinstall with: tcas plugin install agy");
+    }
+    if r.agy.installed && !r.agy.tcas_on_path {
+        println!("  note: tcas is not on PATH (AGY run_command does not add plugin bin/ to PATH)");
     }
 
     println!();

@@ -321,15 +321,40 @@ pub struct Reported {
     seen: HashSet<(String, String)>,
 }
 
-/// Closes a foreground window (`PostToolUse`) and reconciles it. Returns
-/// texts for the session.
+/// Closes a foreground or completed background window (`PostToolUse`) and
+/// reconciles it. Returns texts for the session.
 pub fn close(env: &Env, sid: &str, call_id: &str, rep: &mut Reported) -> R<Vec<String>> {
-    let w = env.d.windows().open.remove(&(sid.to_string(), call_id.to_string()));
+    let w = {
+        let mut windows = env.d.windows();
+        windows
+            .open
+            .remove(&(sid.to_string(), call_id.to_string()))
+            .or_else(|| windows.open.remove(&(sid.to_string(), format!("bg:{call_id}"))))
+    };
     let Some(w) = w else { return Ok(vec![]) };
     let after = resnap(&env.d.git, &w.repos);
     let texts = reconcile(env, sid, &w, &after, rep)?;
     env.d.windows().recent.push((sid.to_string(), w.snap_at, env.now));
     Ok(texts)
+}
+
+/// Promotes open main-agent foreground windows of `sid` into background windows
+/// keyed by `bg:<call_id>` (for harnesses like AGY where `Stop(fullyIdle=false)`
+/// fires while async commands are still running and `PostToolUse` fires on exit).
+pub fn promote_foreground_bash(d: &Daemon, sid: &str) {
+    let mut w = d.windows();
+    let keys: Vec<String> = w
+        .open
+        .iter()
+        .filter(|((s, k), win)| s == sid && !k.starts_with("bg:") && win.agent.is_none())
+        .map(|((_, k), _)| k.clone())
+        .collect();
+    for k in keys {
+        if let Some(mut win) = w.open.remove(&(sid.to_string(), k.clone())) {
+            win.background = true;
+            w.open.insert((sid.to_string(), format!("bg:{k}")), win);
+        }
+    }
 }
 
 /// A background call started: its window stays open under the task ID

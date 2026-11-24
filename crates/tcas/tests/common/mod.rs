@@ -48,6 +48,8 @@ pub fn user_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("TCAS_SESSION")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("ANTIGRAVITY_AGENT")
         .env_remove("TCAS_ALLOW")
         .stdin(Stdio::null());
     for (k, v) in env {
@@ -102,7 +104,9 @@ impl T {
             .current_dir(&self.proj)
             .env("TCAS_HOME", &self.home)
             .env_remove("TCAS_SESSION")
-            .env_remove("CLAUDE_CODE_SESSION_ID");
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT");
         if let Some(s) = session {
             c.env("TCAS_SESSION", s);
         }

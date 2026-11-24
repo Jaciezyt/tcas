@@ -3,6 +3,7 @@
 //! and 7). What does not concern any workspace is decided here, from
 //! `workspaces.json`, without connecting to tcasd.
 
+mod agy;
 mod claude;
 
 use std::io::Read;
@@ -24,6 +25,11 @@ const START_WAIT: Duration = Duration::from_secs(2);
 
 pub fn run(harness: &str) -> i32 {
     if std::env::var_os("TCAS_DISABLE").is_some_and(|v| !v.is_empty()) {
+        let mut input = String::new();
+        let _ = std::io::stdin().take(16 << 20).read_to_string(&mut input);
+        if harness == "agy" {
+            return agy::disabled(&input);
+        }
         return 0;
     }
     let mut input = String::new();
@@ -33,8 +39,9 @@ pub fn run(harness: &str) -> i32 {
     }
     match harness {
         "claude" => claude::run(&input),
+        "agy" => agy::run(&input),
         other => {
-            eprintln!("tcas hook: unknown harness {other:?} (known: claude)");
+            eprintln!("tcas hook: unknown harness {other:?} (known: claude, agy)");
             1
         }
     }

@@ -24,7 +24,9 @@ pub struct Client {
 /// `TCAS_SESSION` written by the hook does.
 pub fn session_from_env() -> Option<String> {
     let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    var("TCAS_SESSION").or_else(|| var("CLAUDE_CODE_SESSION_ID").map(|v| format!("claude:{v}")))
+    var("TCAS_SESSION")
+        .or_else(|| var("CLAUDE_CODE_SESSION_ID").map(|v| format!("claude:{v}")))
+        .or_else(|| var("ANTIGRAVITY_CONVERSATION_ID").map(|v| format!("agy:{v}")))
 }
 
 impl Client {
@@ -68,7 +70,10 @@ impl Client {
             .map_err(|e| format!("{}: {e}", self.home.log().display()))?;
         let log2 = log.try_clone().map_err(|e| e.to_string())?;
         c.current_dir("/").stdin(Stdio::null()).stdout(log).stderr(log2);
-        c.env_remove("TCAS_SESSION").env_remove("CLAUDE_CODE_SESSION_ID");
+        c.env_remove("TCAS_SESSION")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT");
         for v in tcasd::git::LOCAL_VARS {
             c.env_remove(v);
         }

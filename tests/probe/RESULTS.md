@@ -171,3 +171,91 @@ Isolated probes run with `HOME` and `TCAS_HOME` under `/tmp/tcas-probe-m4` (real
 | `tcas git-hook reference-transaction` (non-stash fast path) | 2.8 | 3.1 |
 | `tcas git-hook pre-commit` | 11.1 | 11.9 |
 
+
+## 2026-11-25 — Milestone 6 AGY probes & hook benchmarks (AGY 1.5.16)
+
+Reproduce: `tests/probe/run.sh agy` (or `python3 tests/probe/agy_run.py` / `python3 tests/probe/agy_interactive.py`).
+Environment: `agy 1.5.16`, `--model gemini-3.8-flash-low`, macOS, `git 2.54.0`. Temp repos under `/tmp/tcas-probe-agy` with workspace plugin at `<repo>/.agents/plugins/tcas-probe`; `~/.gemini/config` and `~/.tcas` untouched (`/tmp/tcas-probe-agy` removed afterward).
+
+### Headless (`agy -p`) table
+
+| conclusion | expected | observed | result |
+|---|---|---|---|
+| hooks fire in headless mode (agy -p) | all of PostInvocation,PostToolUse,PreInvocation,PreToolUse,SessionStart,Stop | all present | PASS |
+| conversationId present on all hooks | same non-empty UUID | 8c31a0e1-c088-4355-b00e-25fe43c87f8d | PASS |
+| Item 1: toolCall.name -> arg keys (info) | read/edit/write/cmd names & keys | `{'read_file': ['Path'], 'edit_file': ['Path', 'Replacement', 'Target'], 'write_file': ['Content', 'Path'], 'run_command': ['CommandLine', 'WaitMsBeforeAsync', 'toolSummary']}` | PASS |
+| hook runs in plugin root w/ PLUGIN_ROOT; input.cwd is repo | hook_cwd==PLUGIN_ROOT==plugin_dir, input.cwd==repo | `(True, True, True)` | PASS |
+| PreToolUse decision=allow permits write | ok-allow.txt present | True | PASS |
+| PreToolUse empty `{}` behavior (info) | record whether ok-empty.txt created | `created=False` (empty JSON object `{}` blocks PreToolUse) | INFO |
+| PreToolUse decision=ask in auto mode (info) | record whether ok-ask.txt created | `created=True` | INFO |
+| PreToolUse decision=deny blocks write | deny-1.txt absent | absent | PASS |
+| denied call has no PostToolUse | 0 PostToolUse for deny-1.txt | 0 | PASS |
+| Item 6: plugin bin/ on run_command PATH (info) | check if 'bare' ran | `bare_ran=False (labels=['direct', 'envu'])` | INFO |
+| ANTIGRAVITY_CONVERSATION_ID == conversationId | equal | 8c31a0e1-c088-4355-b00e-25fe43c87f8d | PASS |
+| Item 3: hook ancestor chain [(pid,name,alive_after_exit)] (info) | identify session-scoped pid | `[(38525, 'agy', False), (38517, 'Python', True), ...]` | INFO |
+| Item 3: spawned agy CLI pid alive after -p exit | False (exited) | False | PASS |
+| Item 3: run_command & hook share session-scoped ancestor | shared ancestor with agy CLI/LS that exits with session | `[(38525, 'agy', False), ...]` | PASS |
+| Item 3: env -u strips vars, ancestor still matches agy pid | ANTIGRAVITY_CONVERSATION_ID is None, agy pid in ancestors | `(None, [24073, 38525])` | PASS |
+| failing run_command -> PostToolUse error field (info) | inspect PostToolUse keys/error on non-zero exit | `error == ''` (non-zero shell exit still fires PostToolUse with empty `error`) | INFO |
+| resume (-r) keeps conversationId | 8c31a0e1-c088-4355-b00e-25fe43c87f8d | `['8c31a0e1-c088-4355-b00e-25fe43c87f8d']` | PASS |
+| resume (-r) hook events fired (info) | check if SessionStart or PreInvocation fires | `['PreInvocation', 'PreToolUse', 'PostToolUse', 'PostInvocation', 'PreInvocation', 'PostInvocation', 'Stop']` (no `SessionStart`) | INFO |
+| Item 5: explicit WaitMsBeforeAsync=500 backgrounds command | turn continues while running, PostToolUse fires when cmd ends | `mid_post_invs=1 post_at_end=True` | PASS |
+| Item 5: Stop sequence & fullyIdle (explicit-bg) (info) | Stop(fullyIdle=False) if idle before cmd end, final Stop(fullyIdle=True) | `[('NO_TOOL_CALL', True)]` | INFO |
+| Item 5: bg completion triggers model wakeup PreInvocation (explicit-bg) | PreInvocation fires after bin-wait-end, final Stop fullyIdle=True | `after_end_PreInvocations=1, final_fullyIdle=True` | PASS |
+| Item 5: PROBE-CTX-SessionStart reaches model (explicit-bg) | quoted in model response | True | PASS |
+| Item 5: PROBE-CTX-PreInvocation reaches model (explicit-bg) | quoted in model response | True | PASS |
+| Item 5: PROBE-CTX-PostInvocation reaches model (explicit-bg) | quoted in model response | True | PASS |
+| Item 5: overwrite WaitMsBeforeAsync=500 backgrounds fg command | orig=5000, post=500, turn continues while running, PostToolUse at cmd end | `orig_wait=5000 post_wait=500 mid_post_invs=1 post_at_end=True` | PASS |
+| Item 5: Stop sequence & fullyIdle (rewritten-bg) (info) | Stop(fullyIdle=False) if idle before cmd end, final Stop(fullyIdle=True) | `[('NO_TOOL_CALL', False), ('NO_TOOL_CALL', True)]` | INFO |
+| Item 5: bg completion triggers model wakeup PreInvocation (rewritten-bg) | PreInvocation fires after bin-wait-end, final Stop fullyIdle=True | `after_end_PreInvocations=1, final_fullyIdle=True` | PASS |
+| Item 5: PROBE-CTX-SessionStart reaches model (rewritten-bg) | quoted in model response | True | PASS |
+| Item 5: PROBE-CTX-PreInvocation reaches model (rewritten-bg) | quoted in model response | True | PASS |
+| Item 5: PROBE-CTX-PostInvocation reaches model (rewritten-bg) | quoted in model response | True | PASS |
+| Item 2: PreToolUse hook exit code 1 (info) | measure default block vs allow | `BLOCKED (fail-closed)` | INFO |
+| Item 2: PreToolUse hook exit code 2 + stderr (info) | measure default block vs allow | `BLOCKED (fail-closed)` | INFO |
+| Item 2: PreToolUse hook invalid JSON on stdout (info) | measure default block vs allow | `BLOCKED (fail-closed)` | INFO |
+| Item 2: PreToolUse hook empty stdout (0 bytes) (info) | measure default block vs allow | `CREATED (pass-through)` | INFO |
+| Item 2: PreToolUse hook timeout (>4s) (info) | measure default block vs allow | `BLOCKED (fail-closed)` | INFO |
+| Item 2 control: valid allow write | fine.txt created | True | PASS |
+| Item 2: missing hook binary (info) | measure default block vs allow | `BLOCKED (fail-closed)` | INFO |
+| Item 4: subagent conversationId vs parent (info) | inspect cids & fields | `parent=268f8e45-… all_cids=['268f8e45-…', 'fb65df12-…'] sub_hook_count=12` | INFO |
+| Item 4: subagent hook input keys & transcriptPath (info) | check parent link | `lastUserInput == ''` on all subagent hooks; separate `brain/<sub_cid>/` transcript | INFO |
+| Item 4: subagent shares parent agy process in ancestors | non-empty intersection | `[24073, 40790]` (exact same `(pid, started_at)` as parent) | PASS |
+| Item 6: --dangerously-skip-permissions runs PreToolUse & enforces deny | PreToolUse fired, deny-skip.txt absent, ok-allow.txt present | `(True, True, True)` | PASS |
+| Item 6: --sandbox runs PreToolUse & enforces deny | PreToolUse fired, deny-sb.txt absent, ok-allow.txt present | `(True, True, True)` | PASS |
+
+### Interactive (`agy -i` TUI through a pty) table
+
+| conclusion | expected | observed | result |
+|---|---|---|---|
+| interactive (-i) hooks fire | `['PostInvocation', 'PostToolUse', 'PreInvocation', 'PreToolUse', 'SessionStart', 'Stop']` | `['PostInvocation', 'PostToolUse', 'PreInvocation', 'PreToolUse', 'SessionStart', 'Stop']` | PASS |
+| interactive PreToolUse deny & 0-byte pass-through | deny-ix.txt absent, fail-emptyout-ix.txt present | `(True, True)` | PASS |
+| interactive Stop(fullyIdle) sequence (info) | `[(..., False), (..., True)]` | `[('NO_TOOL_CALL', False), ('NO_TOOL_CALL', True)]` | INFO |
+| interactive bg completion wakes idle TUI | PreInvocation after bin-wait-end & final Stop fullyIdle=True | `(True, True)` | PASS |
+| interactive PROBE-CTX-SessionStart reaches model on screen | present in TUI output | True | PASS |
+| interactive PROBE-CTX-PreInvocation reaches model on screen | present in TUI output | True | PASS |
+| interactive PROBE-CTX-PostInvocation reaches model on screen | present in TUI output | True | PASS |
+| interactive hook ppid (child LS) shared w/ run_command & exits with TUI | 1 distinct ppid, in run_command ancestors, alive=False after exit | `([50106], True, False)` | PASS |
+
+### Raw AGY 1.5.16 facts for the implementation
+
+- **Actual `toolCall.name` & arg keys (`agy 1.5.16`)**: `read_file` (`{"Path"}`), `edit_file` (`{"Path", "Target", "Replacement"}`), `write_file` (`{"Path", "Content", "Overwrite"?, "Append"?}`), `run_command` (`{"CommandLine", "WaitMsBeforeAsync", "toolSummary", "BypassSandbox"?, "IsDaemon"?}`). Paths in `args.Path` are NOT pre-canonicalized (e.g. `/tmp/...` while `input.cwd` is `/private/tmp/...`), so `fsys::normalize` is required.
+- **`PreToolUse` pass-through vs block**: Returning 0 bytes on stdout with exit code 0 passes through to AGY's normal permission flow. Returning `{}`, invalid JSON, non-zero exit code, timing out, or missing hook binary all block the tool call (`fail-closed`). Returning `"BypassSandbox": true` in `overwrite` forces an interactive user confirmation prompt even when `"decision": "allow"`, so hooks must only overwrite `WaitMsBeforeAsync`.
+- **`PostToolUse` & deferred context**: `PostToolUse` always carries `"error": ""` (empty string) when the tool succeeded (including when `run_command` exits non-zero); non-empty `"error"` indicates tool-level failure. `PostToolUse` must output `{}`; hints/warnings are queued in `tcasd` (`defer_context: true`) and emitted via `injectSteps` in the immediately following `PostInvocation` (or wake-up `PreInvocation`).
+- **Background `run_command` (`WaitMsBeforeAsync: 500`) lifecycle**: Unlike Claude Code (which fires `PostToolUse` immediately when a command goes to background), AGY returns control to the model after ~500ms (`PostInvocation` -> `PreInvocation` -> `Stop(fullyIdle: false)`) **without** firing `PostToolUse` yet, and fires `PostToolUse` when the background process actually exits, followed by a wake-up `PreInvocation` -> `PostInvocation` -> `Stop(fullyIdle: true)`. Therefore `tcasd` promotes open foreground `bash` reconcile windows to `bg:<call_id>` on `Stop(fullyIdle: false)` (`keep_background: true`) and closes/reconciles them on `PostToolUse`.
+- **Process ancestry & session liveness**: With `"exec ./bin/tcas hook agy"` in root `hooks.json`, `getppid()` is the session-scoped `agy` process in `-p` mode and the session-local child `agy` language-server process in interactive TUI mode. In both modes, `run_command` descendants have that exact PID in `ancestors()` (even under `env -u ANTIGRAVITY_CONVERSATION_ID` and `--sandbox`), and that PID terminates immediately when the session exits.
+- **Resume (`agy -r` / `--conversation`)**: Preserves `conversationId`, starts a new `agy` PID, and skips `SessionStart` (begins directly with `PreInvocation`). `tcasd` clears `session_ws` when transitioning an `ended` session back to `active` so workspace instructions and reclaimed leases are re-injected on `PreInvocation`.
+- **Subagents (`invoke_subagent`)**: Spawned inside the same `agy` process (identical `(pid, started_at)`), given a distinct `conversationId` (and `ANTIGRAVITY_CONVERSATION_ID` in `run_command`), and have `lastUserInput == ""` on every hook event. `tcasd` aliases subagent conversations matching a live parent `(pid, pid_started_at)` onto `agy:<parent_cid>` (`session_alias`), routing both hooks (`agent = Some(sub_cid)`) and subagent CLI calls to the parent session.
+- **Plugin `bin/` & discovery**: Plugin `bin/` is NOT added to `run_command` `PATH` (`tcas` must be on user `PATH` / `~/.tcas/bin`). Workspace `.agents/plugins/` discovery skips git-ignored `.agents/` directories and only loads after folder trust is accepted in interactive TUI.
+
+### `tcas hook agy` latency (debug build, 50-file repo, 10 iterations each)
+
+| hook invocation | median (ms) | max (ms) |
+|---|---|---|
+| `tcas hook agy` (`SessionStart`) | 3.0 | 3.5 |
+| `tcas hook agy` (`PreInvocation`) | 3.0 | 3.7 |
+| `tcas hook agy` (`PreToolUse` `edit_file`) | 23.5 | 28.7 |
+| `tcas hook agy` (`PostToolUse` `edit_file`) | 9.7 | 16.6 |
+| `tcas hook agy` (`PostInvocation`) | 3.0 | 5.7 |
+| `tcas hook agy` (`PreToolUse` `run_command`) | 11.1 | 38.6 |
+| `tcas hook agy` (`PostToolUse` `run_command`) | 10.7 | 13.1 |

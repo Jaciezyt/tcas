@@ -445,7 +445,7 @@ pub struct HookTool {
 #[serde(rename_all = "camelCase")]
 pub struct HookRequest {
     pub harness: String,
-    /// `session_start`, `prompt`, `pre_tool`, `post_tool`, `stop`, `agent_stop`, `session_end`.
+    /// `session_start`, `prompt`, `pre_tool`, `post_tool`, `post_invocation`, `stop`, `agent_stop`, `session_end`.
     pub event: String,
     /// The harness's own session ID; tcas's is `<harness>:<session>`.
     pub session: String,
@@ -467,6 +467,18 @@ pub struct HookRequest {
     /// stop: background commands still running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_running: Option<Vec<String>>,
+    /// post_tool: queue generated context for a subsequent `post_invocation` / `prompt` hook
+    /// instead of marking notices delivered now (AGY `PostToolUse` cannot inject context).
+    #[serde(default)]
+    pub defer_context: bool,
+    /// stop: background tasks are still running (`fullyIdle == false`), so promote open
+    /// foreground Bash windows to background instead of closing them.
+    #[serde(default)]
+    pub keep_background: bool,
+    /// Whether this hook came from a conversation without user input that may be a subagent
+    /// of an existing live session in the same harness process.
+    #[serde(default)]
+    pub subagent_candidate: bool,
 }
 
 impl HookRequest {

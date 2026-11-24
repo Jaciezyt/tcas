@@ -19,7 +19,12 @@ use crate::{handlers, liveness, store, waits, wsjson};
 
 /// Variables a detached tcasd must not inherit (daemon-and-cli.md section 2).
 pub fn scrub_env() {
-    let mut names: Vec<String> = vec!["TCAS_SESSION".into(), "CLAUDE_CODE_SESSION_ID".into()];
+    let mut names: Vec<String> = vec![
+        "TCAS_SESSION".into(),
+        "CLAUDE_CODE_SESSION_ID".into(),
+        "ANTIGRAVITY_CONVERSATION_ID".into(),
+        "ANTIGRAVITY_AGENT".into(),
+    ];
     names.extend(git::strip_list());
     for n in names {
         // SAFETY: called at startup before any thread is spawned.

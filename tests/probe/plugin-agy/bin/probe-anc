@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# probe-anc <label>: log own ancestors + session env, print them.
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import probe_agy_lib as lib
+
+label = sys.argv[1] if len(sys.argv) > 1 else ""
+details = lib.ancestor_details()
+rec = {
+    "event": "bin-anc",
+    "label": label,
+    "ts": time.time(),
+    "pid": os.getpid(),
+    "ancestors": [d["pid"] for d in details],
+    "ancestor_details": details,
+    "env": {k: os.environ.get(k) for k in lib.ENV_KEYS},
+}
+lib.log(rec)
+print("probe-anc %s ANTIGRAVITY_CONVERSATION_ID=%s TCAS_SESSION=%s" % (
+    label,
+    rec["env"].get("ANTIGRAVITY_CONVERSATION_ID"),
+    rec["env"].get("TCAS_SESSION"),
+))

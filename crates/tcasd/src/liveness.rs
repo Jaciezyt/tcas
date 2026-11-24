@@ -70,6 +70,7 @@ pub fn check(d: &'static Daemon) {
         "DELETE FROM wait_notified WHERE waiter NOT IN (SELECT id FROM session) OR holder NOT IN (SELECT id FROM session)",
         [],
     );
+    let _ = conn.execute("DELETE FROM session_alias WHERE parent NOT IN (SELECT id FROM session)", []);
     if retention > 0 {
         let _ = conn.execute("DELETE FROM event WHERE at < ?1", [now - retention]);
     }

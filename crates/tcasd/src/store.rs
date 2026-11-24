@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS commit_seen(
   hash TEXT NOT NULL, workspace TEXT NOT NULL, root TEXT NOT NULL, repo TEXT NOT NULL,
   by TEXT, at INTEGER NOT NULL, result TEXT NOT NULL,
   PRIMARY KEY(workspace, root, repo, hash));
+CREATE TABLE IF NOT EXISTS session_alias(
+  alias TEXT PRIMARY KEY, parent TEXT NOT NULL, created_at INTEGER NOT NULL);
 "#;
 
 /// Columns added after the first schema, for databases created before them.

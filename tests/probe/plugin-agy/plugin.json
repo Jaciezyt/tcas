@@ -1,0 +1,5 @@
+{
+  "name": "tcas-probe",
+  "version": "0.1.0",
+  "description": "Probe plugin for measuring AGY lifecycle hooks."
+}

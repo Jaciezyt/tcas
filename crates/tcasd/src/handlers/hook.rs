@@ -22,11 +22,12 @@ use crate::text::{self, OtherSessionIntro, Viewer};
 use crate::{bashguard, reconcile, store};
 
 pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
-    let h: HookRequest = args(req)?;
+    let mut h: HookRequest = args(req)?;
     if h.harness.is_empty() || h.harness.contains(':') || h.session.trim().is_empty() {
         return Err(Fail::bad("hook: the harness and the session are required"));
     }
-    let sid = h.session_id();
+    let raw_sid = h.session_id();
+    let sid = resolve_subagent(env, &mut h, &raw_sid)?;
     env.agent = h.agent.clone();
     let res = if h.event == "session_end" {
         session_end(env, &sid, &h)?;
@@ -50,12 +51,66 @@ pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
             "prompt" => prompt(env, &sid, &h)?,
             "pre_tool" => pre_tool(env, &sid, &h)?,
             "post_tool" => post_tool(env, &sid, &h)?,
+            "post_invocation" => post_invocation(env, &sid)?,
             "stop" => stop(env, &sid, &h)?,
             "agent_stop" => agent_stop(env, &sid, &h)?,
             other => return Err(Fail::bad(format!("hook: unknown event {other:?}"))),
         }
     };
     Ok(serde_json::to_value(res).unwrap())
+}
+
+/// Maps a harness subagent conversation (e.g. AGY `invoke_subagent`, which gets
+/// its own `conversationId` inside the parent `agy` process with empty user
+/// input) onto its live parent session so both share leases (leases.md §9).
+fn resolve_subagent(env: &Env, h: &mut HookRequest, raw_sid: &str) -> R<String> {
+    if !h.subagent_candidate {
+        let _ = env.c.execute("DELETE FROM session_alias WHERE alias=?1", [raw_sid]);
+        return Ok(raw_sid.to_string());
+    }
+    let existing: Option<String> = env
+        .c
+        .query_row("SELECT parent FROM session_alias WHERE alias=?1", [raw_sid], |r| r.get(0))
+        .ok();
+    if let Some(parent) = existing
+        && store::session(env.c, &parent)?.is_some_and(|s| s.state != "ended")
+    {
+        h.agent = Some(h.session.clone());
+        if h.event == "stop" {
+            h.event = "agent_stop".into();
+        }
+        return Ok(parent);
+    }
+    // If this ID is already a known root session, keep it.
+    if store::session(env.c, raw_sid)?.is_some() {
+        return Ok(raw_sid.to_string());
+    }
+    if h.pid > 0 {
+        let mut candidates: Vec<store::SessionRow> = store::sessions(env.c)?
+            .into_iter()
+            .filter(|s| {
+                s.id != raw_sid
+                    && s.harness == h.harness
+                    && s.state != "ended"
+                    && s.pid == Some(h.pid)
+                    && s.pid_started_at.is_some_and(|t| (t - h.pid_started_at).abs() <= 1)
+            })
+            .collect();
+        candidates.sort_by_key(|s| -s.started_at);
+        if let Some(parent) = candidates.first() {
+            env.c.execute(
+                "INSERT OR REPLACE INTO session_alias(alias, parent, created_at) VALUES(?1,?2,?3)",
+                params![raw_sid, parent.id, env.now],
+            )?;
+            daemon::mark(&env.d.home, raw_sid);
+            h.agent = Some(h.session.clone());
+            if h.event == "stop" {
+                h.event = "agent_stop".into();
+            }
+            return Ok(parent.id.clone());
+        }
+    }
+    Ok(raw_sid.to_string())
 }
 
 fn with_context(context: Option<String>) -> HookResponse {
@@ -280,14 +335,33 @@ fn prompt(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     Ok(with_context(deliver(env, sid, extra)?))
 }
 
+fn post_invocation(env: &mut Env, sid: &str) -> R<HookResponse> {
+    let mut extra = Vec::new();
+    let ws_ids = session_workspaces(env, sid, &[])?;
+    intro_if_needed(env, sid, &ws_ids, &mut extra)?;
+    Ok(with_context(deliver(env, sid, extra)?))
+}
+
 /// The main agent's turn ended (leases.md section 6): its calls are closed
 /// and the session is idle until its next hook. Background commands that
 /// are no longer running have their windows closed (harness.md section 5.3).
 fn stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
-    let mut rep = reconcile::Reported::default();
-    reconcile::close_foreground(env, sid, None, &mut rep)?;
-    reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?;
-    env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND background_id IS NULL", [sid])?;
+    if h.keep_background {
+        env.c.execute(
+            "DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND kind='edit' AND background_id IS NULL",
+            [sid],
+        )?;
+        env.c.execute(
+            "UPDATE open_call SET background_id=call_id WHERE session=?1 AND agent IS NULL AND kind='bash' AND background_id IS NULL",
+            [sid],
+        )?;
+        reconcile::promote_foreground_bash(env.d, sid);
+    } else {
+        let mut rep = reconcile::Reported::default();
+        reconcile::close_foreground(env, sid, None, &mut rep)?;
+        reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?;
+        env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND background_id IS NULL", [sid])?;
+    }
     env.c.execute("UPDATE session SET state='idle', turn=turn+1 WHERE id=?1 AND state!='ended'", [sid])?;
     Ok(HookResponse::default())
 }
@@ -327,10 +401,18 @@ fn pre_bash(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
         return Ok(HookResponse::default());
     }
     reconcile::open(env, sid, h.agent.as_deref(), &t.call_id, command)?;
+    let bg_id = if t.background && t.background_id.is_some() {
+        if let Some(id) = &t.background_id {
+            reconcile::to_background(env.d, sid, &t.call_id, id);
+        }
+        t.background_id.clone()
+    } else {
+        None
+    };
     env.c.execute(
         "INSERT OR REPLACE INTO open_call(session, agent, call_id, kind, paths, background_id, opened_at) \
-         VALUES(?1,?2,?3,'bash',NULL,NULL,?4)",
-        params![sid, h.agent, t.call_id, env.now],
+         VALUES(?1,?2,?3,'bash',NULL,?4,?5)",
+        params![sid, h.agent, t.call_id, bg_id, env.now],
     )?;
     Ok(HookResponse::default())
 }
@@ -471,7 +553,7 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
             }
             "read" => {
                 touch(env, sid, &t.paths)?;
-                if !t.failed && t.name.as_deref() == Some("Read") {
+                if !t.failed && matches!(t.name.as_deref(), Some("Read" | "read_file" | "view_file")) {
                     extra.extend(read_hints(env, sid, &t.paths)?);
                 }
             }
@@ -484,6 +566,14 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
             }
             _ => {}
         }
+    }
+    if h.defer_context {
+        for item in extra {
+            if !item.is_empty() {
+                env.notice(sid, "hint", json!({ "text": item }))?;
+            }
+        }
+        return Ok(HookResponse::default());
     }
     Ok(with_context(deliver(env, sid, extra)?))
 }

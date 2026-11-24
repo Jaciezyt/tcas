@@ -57,7 +57,7 @@ pub fn global_list(cfg: &GlobalConfig, home: &Home) -> (Vec<ExemptDir>, Vec<Stri
         }
         push(&mut out, &home.dir, &tilde(&home.dir, uhome.as_deref()), "built-in: tcas's own directory");
         if let Some(h) = &uhome {
-            for d in [".claude", ".codex"] {
+            for d in [".claude", ".gemini", ".codex"] {
                 push(&mut out, &h.join(d), &format!("~/{d}"), "built-in: harness directory");
             }
         }
@@ -106,6 +106,12 @@ mod tests {
         let real = real.to_string_lossy();
         assert!(tcas_core::exempt::find(&list, &format!("{real}/x")).is_some());
         assert!(tcas_core::exempt::find(&list, "/tmp/x").is_some());
+        if let Some(uh) = user_home() {
+            for d in [".claude", ".gemini", ".codex"] {
+                let p = format!("{}/{d}/brain/x", uh.to_string_lossy());
+                assert!(tcas_core::exempt::find(&list, &p).is_some(), "missing built-in exempt for {d}");
+            }
+        }
         let mut cfg = GlobalConfig::default();
         cfg.exempt.builtin = false;
         assert!(global_list(&cfg, &home).0.is_empty());

@@ -38,6 +38,17 @@ fn plugin_path_writes_skill_md() {
     assert!(dir.join("bin/tcas").is_file());
     assert!(dir.join("hooks/hooks.json").is_file());
     assert!(dir.join(".claude-plugin/plugin.json").is_file());
+
+    let oa = t.cmd(None, &["plugin", "path", "agy"]).env("HOME", &uhome).output().unwrap();
+    assert!(oa.status.success(), "{}", String::from_utf8_lossy(&oa.stderr));
+    let agy_dir = Path::new(std::str::from_utf8(&oa.stdout).unwrap().trim());
+    assert_eq!(agy_dir, t.home.join("plugins/tcas"));
+    assert!(agy_dir.join("plugin.json").is_file());
+    assert!(agy_dir.join("hooks.json").is_file(), "AGY hooks.json must be at plugin root");
+    assert!(!agy_dir.join("hooks/hooks.json").exists());
+    assert!(agy_dir.join("bin/tcas").is_file());
+    let agy_skill = std::fs::read_to_string(agy_dir.join("skills/tcas/SKILL.md")).unwrap();
+    assert!(agy_skill.contains("WaitMsBeforeAsync: 500"), "{agy_skill}");
 }
 
 #[test]
@@ -186,6 +197,8 @@ fn doctor_stopped_running_malformed_toml_and_old_git() {
     assert_eq!(rj["tcasd"]["version_mismatch"], false);
     assert_eq!(rj["workspace"]["name"], "app");
     assert_eq!(rj["workspace"]["repos"][0]["hooks_installed"], true);
+    assert!(rj["agy"].is_object(), "doctor JSON must include agy section: {rj}");
+    assert_eq!(rj["agy"]["minimum_version"], "1.5.16");
     let problems = rj["problems"].as_array().unwrap();
     assert!(!problems.is_empty(), "expected parse problem for malformed .tcas.toml: {rj}");
     assert!(problems.iter().any(|p| p.as_str().unwrap_or("").contains(".tcas.toml")), "{rj}");
@@ -230,6 +243,122 @@ exec "{real_git}" "$@"
     assert!(shim_out.status.success());
     let sj: Value = serde_json::from_slice(&shim_out.stdout).unwrap();
     assert_eq!(sj["git"]["config_hooks_supported"], false, "{sj}");
+}
+
+#[test]
+fn plugin_install_agy_and_doctor_checks() {
+    let t = T::new();
+    let uhome = setup_fake_home(&t);
+    let bin = t.root.join("mockagy");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls_log = t.root.join("agy_calls.log");
+    let inst_dir = uhome.join(".gemini/config/plugins/tcas");
+    let cfg_json = uhome.join(".gemini/config/config.json");
+
+    let mock_agy = format!(
+        r#"#!/bin/sh
+echo "$@" >> "{calls}"
+case "$1" in
+  "--version")
+    echo "1.5.16"
+    exit 0
+    ;;
+  "plugin")
+    sub="$2"
+    case "$sub" in
+      "install")
+        src="$3"
+        if [ -d "{inst}" ]; then
+          echo "Error: plugin tcas is already installed" >&2
+          exit 1
+        fi
+        mkdir -p "{inst}"
+        cp -R "$src"/* "{inst}/"
+        exit 0
+        ;;
+      "uninstall")
+        rm -rf "{inst}"
+        exit 0
+        ;;
+      "enable")
+        mkdir -p "$(dirname "{cfg}")"
+        printf '{{"plugins":{{"tcas":{{"enabled":true}}}}}}\n' > "{cfg}"
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"#,
+        calls = calls_log.display(),
+        inst = inst_dir.display(),
+        cfg = cfg_json.display(),
+    );
+    write_exec(&bin.join("agy"), &mock_agy);
+    let path_env = format!("{}:{}", bin.display(), path_with_tcas());
+
+    // Session callers are refused with exit code 6 (including via ANTIGRAVITY_CONVERSATION_ID).
+    let sess_try = t.cmd(None, &["plugin", "install", "agy"])
+        .env("HOME", &uhome)
+        .env("ANTIGRAVITY_CONVERSATION_ID", "conv-1234")
+        .output()
+        .unwrap();
+    assert_eq!(sess_try.status.code(), Some(6));
+
+    // First install -> action = "installed"
+    let out1 = t.cmd(None, &["--json", "plugin", "install", "agy"])
+        .env("HOME", &uhome)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(out1.status.success(), "{}\n{}", String::from_utf8_lossy(&out1.stdout), String::from_utf8_lossy(&out1.stderr));
+    let j1: Value = serde_json::from_slice(&out1.stdout).unwrap();
+    assert_eq!(j1["harness"], "agy");
+    assert_eq!(j1["action"], "installed");
+    assert_eq!(j1["enabled"], true);
+    assert!(inst_dir.join("hooks.json").is_file());
+    assert!(inst_dir.join("plugin.json").is_file());
+
+    // Disable in config.json, then re-run install -> uninstalls + installs + enables -> "updated"
+    std::fs::create_dir_all(cfg_json.parent().unwrap()).unwrap();
+    std::fs::write(&cfg_json, r#"{"plugins":{"tcas":{"enabled":false}}}"#).unwrap();
+
+    let d_disabled = t.cmd(None, &["--json", "doctor"])
+        .env("HOME", &uhome)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    let dj_dis: Value = serde_json::from_slice(&d_disabled.stdout).unwrap();
+    assert_eq!(dj_dis["agy"]["plugin_installed"], true);
+    assert_eq!(dj_dis["agy"]["plugin_enabled"], false);
+
+    let out2 = t.cmd(None, &["plugin", "install", "agy"])
+        .env("HOME", &uhome)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(out2.status.success(), "{}", String::from_utf8_lossy(&out2.stderr));
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("updated agy plugin tcas"));
+    let calls = std::fs::read_to_string(&calls_log).unwrap();
+    assert!(calls.contains("plugin uninstall tcas"), "{calls}");
+    assert!(calls.contains("plugin enable tcas"), "{calls}");
+
+    let d_ok = t.cmd(None, &["--json", "doctor"])
+        .env("HOME", &uhome)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    let dj_ok: Value = serde_json::from_slice(&d_ok.stdout).unwrap();
+    assert_eq!(dj_ok["agy"]["installed"], true);
+    assert_eq!(dj_ok["agy"]["version"], "1.5.16");
+    assert_eq!(dj_ok["agy"]["meets_minimum"], true);
+    assert_eq!(dj_ok["agy"]["tested"], true);
+    assert_eq!(dj_ok["agy"]["plugin_files_ok"], true);
+    assert_eq!(dj_ok["agy"]["plugin_installed"], true);
+    assert_eq!(dj_ok["agy"]["plugin_enabled"], true);
+    assert_eq!(dj_ok["agy"]["installed_hooks_ok"], true);
+    assert_eq!(dj_ok["agy"]["installed_bin_executable"], true);
+    assert_eq!(dj_ok["agy"]["tcas_on_path"], true);
 }
 
 #[test]
