@@ -72,6 +72,7 @@ pub fn run(home: Home) -> Result<(), String> {
         started_at: tcas_sys::clock::now_ms(),
         pid: std::process::id() as i32,
         socket: sock.clone(),
+        windows: Mutex::new(Default::default()),
     }));
     {
         let g = d.global();

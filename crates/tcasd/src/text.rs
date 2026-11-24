@@ -174,6 +174,113 @@ pub fn took_over(from: &[String], paths: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Bash (harness.md section 5)
+
+fn table(rows: &[(String, String)]) -> String {
+    let w = rows.iter().map(|r| r.0.chars().count() + 4).max().unwrap_or(0);
+    rows.iter().map(|(p, h)| format!("  {}{h}", pad(p, w))).collect::<Vec<_>>().join("\n")
+}
+
+/// The session's Bash command changed files other sessions hold.
+pub fn overreach_self(rows: &[(String, String)]) -> String {
+    format!(
+        "tcas: your last command changed files that other sessions hold:\n{}\nDo not change them again, and do not \
+         try to undo it yourself (by Bash or git): the holders have been told, with your command, and will decide \
+         whether to keep or revert the change. If you need these files, request them (tcas lease wait …) or tell the \
+         user.",
+        table(rows)
+    )
+}
+
+/// Another session was running Bash at the same time: who changed them is
+/// not known.
+pub fn uncertain_self(rows: &[(String, String)]) -> String {
+    format!(
+        "tcas: these files, held by other sessions, changed while your command ran:\n{}\nAnother command was running \
+         at the same time, so it is not known which one changed them. If yours did, do not change them again; the \
+         holders have been told.",
+        table(rows)
+    )
+}
+
+pub fn unattributed_self(paths: &[String]) -> String {
+    let more = if paths.len() > 10 { format!(" and {} more", paths.len() - 10) } else { String::new() };
+    format!(
+        "tcas: these files changed while your command ran, and another session was running a command at the same \
+         time, so they were not attributed to you: {}{more}.\nIf you changed them and will keep working on them, \
+         request them:  tcas lease acquire <path>…",
+        paths.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+    )
+}
+
+pub fn bash_strict(paths: &[String]) -> String {
+    format!(
+        "tcas: this workspace is in strict mode. Your command changed {}, which you had not requested; the leases \
+         were given to you so the changes stay protected. Request files before changing them:  tcas lease acquire \
+         <path>… --brief \"…\"",
+        paths.join(", ")
+    )
+}
+
+pub fn worktree_outside(shown: &str) -> String {
+    format!(
+        "tcas: your command created a worktree at {shown}, which is outside every workspace. Sessions working there \
+         are not coordinated with the others. To manage it, add it to the workspace:\n  tcas workspace add {}",
+        shell_quote(shown.trim_end_matches('/'))
+    )
+}
+
+/// (path relative to the checkout, holder, ` "quote"`, left behind).
+type HookRow = (String, String, String, bool);
+
+fn hook_rows(rows: &[HookRow]) -> String {
+    let w = rows.iter().map(|r| r.0.chars().count() + 4).max().unwrap_or(0);
+    rows.iter()
+        .map(|(p, h, q, gone)| {
+            let state = if *gone { " (session ended)" } else { "" };
+            format!("  {}leased by {}{q}{state}", pad(p, w), short_session(h))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `pre-commit` refused (harness.md section 5.6).
+pub fn commit_refused(rows: &[HookRow], user: bool) -> String {
+    let mut t = format!(
+        "tcas: commit refused. It includes files that other sessions are still working on:\n{}\nCommit only your own \
+         files:   tcas commit -m \"…\"    or    git commit -m \"…\" -- <paths>",
+        hook_rows(rows)
+    );
+    if user {
+        t.push_str("\nTo commit them anyway:        TCAS_ALLOW=1 git commit …      (git commit --no-verify also skips this)");
+    }
+    t
+}
+
+/// `pre-commit` let the user commit files left behind by ended sessions.
+pub fn commit_left_behind(rows: &[HookRow]) -> String {
+    format!(
+        "tcas: this commit includes changes left by sessions that have ended; committing them releases their \
+         leases:\n{}",
+        hook_rows(rows)
+    )
+}
+
+/// `pre-rebase` or a stash refused.
+pub fn git_refused(what: &str, repo: &str, rows: &[HookRow], user: bool) -> String {
+    let mut t = format!(
+        "tcas: {what} refused in {repo}: other sessions hold leases there and have uncommitted work:\n{}",
+        hook_rows(rows)
+    );
+    if user {
+        t.push_str(&format!("\nTo do it anyway:  TCAS_ALLOW=1 {what} …"));
+    } else {
+        t.push_str("\nIf it needs doing, tell the user.");
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------
 // Notices
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -182,6 +289,11 @@ fn s<'a>(v: &'a Value, k: &str) -> &'a str {
 
 fn strs(v: &Value, k: &str) -> Vec<String> {
     v.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect()
+}
+
+fn one_line(c: &str) -> String {
+    let first: String = c.lines().next().unwrap_or("").chars().take(300).collect();
+    if c.lines().count() > 1 || c.chars().count() > 300 { format!("{first} …") } else { first }
 }
 
 fn pad(s: &str, w: usize) -> String {
@@ -344,6 +456,47 @@ pub fn notice(kind: &str, b: &Value) -> Option<String> {
             "tcas: {} had uncommitted changes that this session did not make. Look at them before editing further.",
             strs(b, "paths").join(", ")
         ),
+        "bash.overreach" => format!(
+            "tcas: another session ({}) changed files you hold with a Bash command:\n  {}\nIts command:\n  {}\nRe-read \
+             them before editing. Keep or revert that change as your work needs; that session was told not to touch \
+             them again.",
+            short_session(s(b, "by")),
+            strs(b, "paths").join(", "),
+            one_line(s(b, "command"))
+        ),
+        "bash.uncertain" => format!(
+            "tcas: files you hold changed while another session ({}) was running a Bash command, and so were you; it \
+             is not known which command changed them:\n  {}\nIts command:\n  {}\nIf your own command did not change \
+             them, re-read them before editing.",
+            short_session(s(b, "by")),
+            strs(b, "paths").join(", "),
+            one_line(s(b, "command"))
+        ),
+        "branch.changed" => {
+            let by = match b.get("by").and_then(Value::as_str) {
+                Some(x) => format!(" by {}", short_session(x)),
+                None => String::new(),
+            };
+            format!(
+                "tcas: the branch of {} changed{by} (from {} to {}). Files you are working on may have changed; \
+                 re-read them before editing further.",
+                s(b, "repo"),
+                b.get("from").and_then(Value::as_str).unwrap_or("?"),
+                b.get("to").and_then(Value::as_str).unwrap_or("?")
+            )
+        }
+        "git.rewrite" => {
+            let by = match b.get("by").and_then(Value::as_str) {
+                Some(x) => short_session(x),
+                None => "the user".into(),
+            };
+            format!(
+                "tcas: {by} ran a git {} in {}, which can change files in the working tree. Re-read the files you are \
+                 working on before editing further.",
+                s(b, "what"),
+                s(b, "repo")
+            )
+        }
         _ => return None,
     })
 }

@@ -180,7 +180,7 @@ pub fn run(input: &str) -> i32 {
             0
         }
         "PreToolUse" if tool_name == "Bash" => {
-            pre_bash(&local, &v, &cwd);
+            pre_bash(&local, &v, &cwd, &sid, base, deadline);
             0
         }
         "PostToolUse" | "PostToolUseFailure" => {
@@ -286,9 +286,11 @@ fn read_paths(v: &Value, cwd: &str) -> Vec<String> {
     out
 }
 
-/// Bash before it runs (harness.md section 5.5). The command guard and the
-/// reconcile window come with milestone 3.
-fn pre_bash(local: &Local, v: &Value, cwd: &str) {
+/// Bash before it runs (harness.md sections 5.1, 5.2 and 5.5): `tcas`
+/// commands are approved here; paths only the user may change are refused
+/// here; the rest goes to tcasd (the guard and the reconcile window) when
+/// the command concerns a workspace. Fail-closed like edits (section 7).
+fn pre_bash(local: &Local, v: &Value, cwd: &str, sid: &str, base: HookRequest, deadline: Instant) {
     let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
     let Some(command) = s(&input, "command") else { return };
     let background = input.get("run_in_background").and_then(Value::as_bool).unwrap_or(false);
@@ -317,7 +319,57 @@ fn pre_bash(local: &Local, v: &Value, cwd: &str) {
     }
     if guard::has_tcas_wait(&parsed) && !background {
         decision("deny", &wait_in_background(command), None);
+        return;
     }
+    if let Some(reason) = protected_in(local, &parsed) {
+        decision("deny", &reason, None);
+        return;
+    }
+    // Directories the command acts in: its own, every `cd`, every `git -C`.
+    let mut dirs: Vec<String> = vec![cwd.to_string()];
+    for c in &parsed.commands {
+        dirs.push(c.dir.clone());
+        if let Some(g) = guard::git_call(c) {
+            dirs.push(g.dir.clone());
+        }
+    }
+    let concerns = dirs.iter().any(|d| local.managed(d));
+    if !(concerns || local.marked(sid)) {
+        return;
+    }
+    let tool = HookTool {
+        kind: "bash".into(),
+        call_id: s(v, "tool_use_id").unwrap_or("").to_string(),
+        name: Some("Bash".into()),
+        command: Some(command.to_string()),
+        background,
+        ..HookTool::default()
+    };
+    let h = HookRequest { event: "pre_tool".into(), tool: Some(tool), ..base };
+    match contact(local, &h, deadline) {
+        Ok(r) if r.decision.as_deref() == Some("deny") => decision("deny", &denial_text(&r), None),
+        Ok(_) => {}
+        Err(e) if concerns => decision("deny", &unavailable(&e), None),
+        Err(_) => {}
+    }
+}
+
+/// Arguments or redirect targets naming tcas's home or a workspace's
+/// `.tcas.toml` (harness.md section 5.1). Read-only programs may name them.
+fn protected_in(local: &Local, parsed: &shell::Parsed) -> Option<String> {
+    for c in &parsed.commands {
+        let args: Vec<&str> = if guard::is_read_only(c) { vec![] } else { c.words.iter().skip(1).map(|w| w.text()).collect() };
+        for w in args.into_iter().chain(c.redirects.iter().map(|w| w.text())) {
+            let w = if w.starts_with('-') { w.split_once('=').map(|(_, v)| v).unwrap_or("") } else { w };
+            if w.is_empty() {
+                continue;
+            }
+            if let Some(r) = local.protected(&shell::join_dir(&c.dir, w)) {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 
 fn wait_in_background(command: &str) -> String {

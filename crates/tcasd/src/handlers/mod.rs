@@ -1,5 +1,6 @@
 //! Request dispatch. Each request runs in one transaction.
 
+pub mod git;
 pub mod hook;
 pub mod info;
 pub mod lease;
@@ -57,6 +58,12 @@ pub fn dispatch(d: &'static Daemon, req: Request, stream: &UnixStream) -> Respon
                 "daemon.status" => info::daemon_status(env),
                 "whoami" => Ok(json!({ "caller": env.caller.label(), "user": env.caller.is_user() })),
                 "hook" => hook::handle(env, &req),
+                "git.hook" => git::hook(env, &req),
+                "commit.prepare" => git::prepare(env, &req),
+                "commit.done" => git::done(env, &req),
+                "git_hooks.install" => git::hooks_install(env, &req),
+                "git_hooks.remove" => git::hooks_remove(env, &req),
+                "git_hooks.status" => git::hooks_status(env, &req),
                 other => Err(Fail::bad(format!("unknown operation {other:?}"))),
             })
         }
@@ -148,6 +155,12 @@ fn housekeeping(env: &mut Env) -> R<bool> {
 }
 
 pub fn repo_gone(env: &Env, ws: &crate::world::Ws, root: &str, dir: &str) -> R<()> {
+    let gone: Vec<(PathBuf, Option<String>)> = ws
+        .repos
+        .iter()
+        .filter(|r| r.root == root && r.dir == dir)
+        .map(|r| (ws.repo_abs(root, dir), r.common_dir.clone()))
+        .collect();
     env.c.execute(
         "DELETE FROM repo WHERE workspace=?1 AND root=?2 AND dir=?3",
         rusqlite::params![ws.row.id, root, dir],
@@ -158,5 +171,5 @@ pub fn repo_gone(env: &Env, ws: &crate::world::Ws, root: &str, dir: &str) -> R<(
         }
     }
     env.event(Some(&ws.row.id), None, "repo.gone", json!({ "root": root, "dir": dir }))?;
-    Ok(())
+    workspace::remove_hooks(env, &gone)
 }

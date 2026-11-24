@@ -439,12 +439,30 @@ pub fn who(o: &Out, entries: &[WhoEntry]) -> i32 {
     0
 }
 
+const BRANCH_CHANGED_RECENT_MS: i64 = 3_600_000;
+
+fn branch_note(o: &Out, changed_at: Option<i64>) -> String {
+    let Some(at) = changed_at else { return String::new() };
+    let age = o.now - at;
+    if !(0..=BRANCH_CHANGED_RECENT_MS).contains(&age) {
+        return String::new();
+    }
+    format!("   (branch changed {} ago)", human::duration(age))
+}
+
+fn repo_branch(o: &Out, r: &RepoView) -> String {
+    match &r.branch {
+        Some(b) => format!("{b}{}", branch_note(o, r.branch_changed_at)),
+        None => String::new(),
+    }
+}
+
 fn repo_lines(o: &Out, ws: &WorkspaceView, root: Option<&str>) {
     let repos: Vec<&RepoView> = ws.repos.iter().filter(|r| root.is_none_or(|n| r.root == n)).collect();
     let w = width(repos.iter().map(|r| r.display.as_str()), 12);
     for r in repos {
         let shown = if ws.roots.len() > 1 && root.is_some() { o.tilde(&r.abs) } else { r.display.clone() };
-        println!("  {}{}{}", pad(&shown, w.max(shown.len() + 2)), pad(&r.kind, 11), r.branch.as_deref().unwrap_or(""));
+        println!("  {}{}{}", pad(&shown, w.max(shown.len() + 2)), pad(&r.kind, 11), repo_branch(o, r));
     }
 }
 
@@ -554,20 +572,21 @@ pub fn status(o: &Out, s: &StatusResult) -> i32 {
                 .repos
                 .iter()
                 .find(|x| x.root == r.name && x.dir.is_empty())
-                .and_then(|x| x.branch.clone())
+                .map(|x| repo_branch(o, x))
                 .unwrap_or_default();
             println!("  {}{}{branch}", pad(&r.name, 15), pad(&o.tilde(&r.path), 28));
         }
         let nested: Vec<&RepoView> = ws.repos.iter().filter(|x| !x.dir.is_empty()).collect();
         for x in nested {
-            println!("  {}{}{}", pad(&x.display, 43), pad(&x.kind, 11), x.branch.as_deref().unwrap_or(""));
+            println!("  {}{}{}", pad(&x.display, 43), pad(&x.kind, 11), repo_branch(o, x));
         }
     } else if single_repo_at_root {
         println!(
-            "workspace  {}   mode {}   branch {}",
+            "workspace  {}   mode {}   branch {}{}",
             o.tilde(&ws.roots[0].path),
             ws.mode,
-            ws.repos[0].branch.as_deref().unwrap_or("?")
+            ws.repos[0].branch.as_deref().unwrap_or("?"),
+            branch_note(o, ws.repos[0].branch_changed_at)
         );
     } else {
         println!("workspace  {}   mode {}", o.tilde(&ws.roots.first().map(|r| r.path.clone()).unwrap_or_default()), ws.mode);

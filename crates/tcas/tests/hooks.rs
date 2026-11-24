@@ -6,233 +6,12 @@ mod common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use common::*;
-
-/// A Claude Code session as its hooks see it.
-struct S<'a> {
-    t: &'a T,
-    id: String,
-    cwd: PathBuf,
-    proc: Child,
-    calls: std::cell::Cell<u32>,
-}
-
-impl Drop for S<'_> {
-    fn drop(&mut self) {
-        let _ = self.proc.kill();
-        let _ = self.proc.wait();
-    }
-}
-
-/// What a hook printed: nothing, a decision, or context.
-struct Out {
-    code: i32,
-    v: Value,
-    err: String,
-}
-
-impl Out {
-    fn denied(&self) -> bool {
-        self.v["hookSpecificOutput"]["permissionDecision"] == "deny"
-    }
-    fn allowed(&self) -> bool {
-        self.v["hookSpecificOutput"]["permissionDecision"] == "allow"
-    }
-    fn reason(&self) -> String {
-        self.v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap_or("").to_string()
-    }
-    fn context(&self) -> String {
-        self.v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string()
-    }
-    fn silent(&self) -> bool {
-        self.v.is_null()
-    }
-}
-
-impl<'a> S<'a> {
-    fn new(t: &'a T, id: &str) -> S<'a> {
-        S::at(t, id, &t.proj)
-    }
-
-    fn at(t: &'a T, id: &str, cwd: &Path) -> S<'a> {
-        let proc = Command::new("sleep").arg("600").stdin(Stdio::null()).spawn().unwrap();
-        S { t, id: id.into(), cwd: cwd.to_path_buf(), proc, calls: 0.into() }
-    }
-
-    fn sid(&self) -> String {
-        format!("claude:{}", self.id)
-    }
-
-    fn call_id(&self) -> String {
-        self.calls.set(self.calls.get() + 1);
-        format!("toolu_{}_{}", self.id, self.calls.get())
-    }
-
-    fn hook(&self, mut input: Value) -> Out {
-        self.hook_env(&mut input, &[])
-    }
-
-    fn hook_env(&self, input: &mut Value, env: &[(&str, &str)]) -> Out {
-        input["session_id"] = json!(self.id);
-        input["transcript_path"] = json!("/dev/null");
-        if input.get("cwd").is_none() {
-            input["cwd"] = json!(self.cwd);
-        }
-        let mut c = Command::new(TCAS);
-        c.args(["hook", "claude"])
-            .current_dir(&self.cwd)
-            .env("TCAS_HOME", &self.t.home)
-            .env("TCAS_HOOK_PID", self.proc.id().to_string())
-            .env_remove("TCAS_SESSION")
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("TCAS_DISABLE")
-            .env_remove("CLAUDE_ENV_FILE")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in env {
-            c.env(k, v);
-        }
-        let mut child = c.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
-        let o = child.wait_with_output().unwrap();
-        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        let v = if out.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&out).unwrap_or_else(|e| panic!("hook output is not JSON ({e}): {out}"))
-        };
-        let r = Out { code: o.status.code().unwrap_or(-1), v, err: String::from_utf8_lossy(&o.stderr).into_owned() };
-        assert_eq!(r.code, 0, "hook exited {}: {}", r.code, r.err);
-        r
-    }
-
-    fn start(&self, source: &str) -> Out {
-        self.hook(json!({ "hook_event_name": "SessionStart", "source": source }))
-    }
-
-    fn prompt(&self, text: &str) -> Out {
-        self.hook(json!({ "hook_event_name": "UserPromptSubmit", "prompt": text }))
-    }
-
-    /// PreToolUse and, when allowed, the file change and PostToolUse.
-    fn edit(&self, path: &Path, text: &str) -> Out {
-        let id = self.call_id();
-        let input = json!({ "file_path": path, "content": text });
-        let pre = self.hook(json!({ "hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": input, "tool_use_id": id }));
-        if pre.denied() {
-            return pre;
-        }
-        std::fs::write(path, text).unwrap();
-        let post = self.hook(json!({
-            "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": input, "tool_use_id": id,
-            "tool_response": { "type": "update", "filePath": path }
-        }));
-        Out { code: post.code, v: if post.silent() { pre.v } else { post.v }, err: post.err }
-    }
-
-    fn pre_edit(&self, path: &Path) -> Out {
-        let id = self.call_id();
-        self.hook(json!({
-            "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_use_id": id,
-            "tool_input": { "file_path": path, "old_string": "a", "new_string": "b", "replace_all": false }
-        }))
-    }
-
-    fn pre_bash(&self, command: &str, background: bool) -> Out {
-        let id = self.call_id();
-        let mut input = json!({ "command": command, "description": "test" });
-        if background {
-            input["run_in_background"] = json!(true);
-        }
-        self.hook(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": input, "tool_use_id": id }))
-    }
-
-    /// Any tool finishing: where notices are delivered.
-    fn post_other(&self) -> Out {
-        let id = self.call_id();
-        self.hook(json!({
-            "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": id,
-            "tool_input": { "command": "true" }, "tool_response": { "stdout": "", "stderr": "", "interrupted": false }
-        }))
-    }
-
-    fn read(&self, path: &Path) -> Out {
-        let id = self.call_id();
-        self.hook(json!({
-            "hook_event_name": "PostToolUse", "tool_name": "Read", "tool_use_id": id,
-            "tool_input": { "file_path": path }, "tool_response": { "type": "text" }
-        }))
-    }
-
-    fn stop(&self) -> Out {
-        self.hook(json!({ "hook_event_name": "Stop", "stop_hook_active": false, "background_tasks": [] }))
-    }
-
-    fn end(&self, reason: &str) -> Out {
-        self.hook(json!({ "hook_event_name": "SessionEnd", "reason": reason }))
-    }
-
-    /// `tcas …` run by this session from its Bash tool.
-    fn tcas(&self, args: &[&str]) -> Run {
-        let mut c = self.t.cmd(Some(&self.sid()), args);
-        c.current_dir(&self.cwd);
-        let o = c.stdin(Stdio::null()).output().unwrap();
-        Run {
-            code: o.status.code().unwrap_or(-1),
-            out: String::from_utf8_lossy(&o.stdout).into_owned(),
-            err: String::from_utf8_lossy(&o.stderr).into_owned(),
-        }
-    }
-
-    fn spawn_tcas(&self, args: &[&str]) -> Child {
-        let mut c = self.t.cmd(Some(&self.sid()), args);
-        c.current_dir(&self.cwd);
-        c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
-    }
-}
-
-/// One repository at the workspace root, opened.
-fn one_repo(t: &T) -> PathBuf {
-    let r = t.repo("app", &[("a.txt", "a\n"), ("b.txt", "b\n"), ("src/auth/x.ts", "x\n"), ("src/auth/y.ts", "y\n"), ("src/util/z.ts", "z\n"), (".gitignore", "dist/\n")]);
-    let out = t.cmd(None, &["workspace", "open"]).current_dir(&r).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    r
-}
-
-fn leases(t: &T) -> Vec<(String, String, String, String)> {
-    let all = t.ok(None, &["--json", "lease", "list"]).json();
-    let mut v: Vec<(String, String, String, String)> = all
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|l| {
-            (
-                l["session"].as_str().unwrap().into(),
-                l["path"]["display"].as_str().unwrap().into(),
-                l["source"].as_str().unwrap().into(),
-                l["state"].as_str().unwrap().into(),
-            )
-        })
-        .collect();
-    v.sort();
-    v
-}
-
-fn events(t: &T) -> Vec<Value> {
-    t.ok(None, &["--json", "log", "-n", "500", "--all"]).json().as_array().unwrap().clone()
-}
-
-fn commit(dir: &Path, paths: &[&str]) {
-    let mut args = vec!["commit", "-qm", "x", "--"];
-    args.extend(paths);
-    git(dir, &args);
-}
 
 // ---------------------------------------------------------------------------
 
@@ -352,7 +131,9 @@ fn background_wait_and_notice() {
     let waiter = b.spawn_tcas(&["lease", "wait", "a.txt", "--timeout", "30", "--brief", "add a line"]);
     t.until("the wait to register", || t.daemon_waits() == 1);
     b.stop();
-    commit(&app, &["a.txt"]);
+    // A commits its own file (case 22): the post-commit hook releases it.
+    let c = a.tcas(&["commit", "-m", "x"]);
+    assert_eq!(c.code, 0, "{}\n{}", c.out, c.err);
     let r = finish(waiter);
     assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
     assert!(leases(&t).iter().any(|l| l.0 == "claude:bbbb3333-4444" && l.1 == "a.txt" && l.2 == "wait"));
@@ -402,6 +183,47 @@ fn wait_for_orphan_after_discard() {
     let r = finish(waiter);
     assert_eq!(r.code, 0, "{}", r.out);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// Case 29: B waits for `a.txt` and gets it, does not touch it; within grace
+/// A is denied, after grace A succeeds, B's lease yields, and B receives
+/// the `lease.yielded` notice.
+#[test]
+fn waited_lease_yields_after_grace() {
+    let t = T::new();
+    let app = one_repo(&t);
+    std::fs::write(app.join(".tcas.toml"), "[lease]\nwaited_grace_secs = 2\n").unwrap();
+    git(&app, &["add", ".tcas.toml"]);
+    commit(&app, &[".tcas.toml"]);
+    let (a, b) = (S::at(&t, "aaaa1111-2222", &app), S::at(&t, "bbbb3333-4444", &app));
+    a.start("startup");
+    b.start("startup");
+    a.edit(&app.join("a.txt"), "A\n");
+
+    let waiter = b.spawn_tcas(&["lease", "wait", "a.txt", "--timeout", "30", "--brief", "need a"]);
+    t.until("the wait to register", || t.daemon_waits() == 1);
+    let c = a.tcas(&["commit", "-m", "a"]);
+    assert_eq!(c.code, 0, "{}\n{}", c.out, c.err);
+    let w = finish(waiter);
+    assert_eq!(w.code, 0, "{}\n{}", w.out, w.err);
+    assert_eq!(leases(&t), [("claude:bbbb3333-4444".into(), "a.txt".into(), "wait".into(), "active".into())]);
+    // Consume wait.granted so the later yield notice is checked cleanly.
+    b.post_other();
+
+    let r = a.pre_edit(&app.join("a.txt"));
+    assert!(r.denied(), "{}", r.v);
+    assert!(r.reason().contains("just given to them after a wait"), "{}", r.reason());
+
+    std::thread::sleep(Duration::from_millis(2200));
+    let r = a.edit(&app.join("a.txt"), "A2\n");
+    assert!(r.silent(), "{}", r.v);
+    assert_eq!(leases(&t), [("claude:aaaa1111-2222".into(), "a.txt".into(), "edit".into(), "active".into())]);
+
+    let ctx = b.post_other().context();
+    assert!(ctx.starts_with("tcas: these leases of yours were given to other sessions:"), "{ctx}");
+    assert!(ctx.contains("a.txt") && ctx.contains("no uncommitted changes"), "{ctx}");
+    let ev = events(&t);
+    assert!(ev.iter().any(|e| e["type"] == "lease.released" && e["payload"]["reason"] == "yielded"), "{ev:?}");
 }
 
 /// Case 28 and harness.md 5.5: tcas commands are approved, a foreground

@@ -64,9 +64,20 @@ pub fn status(env: &mut Env, req: &Request) -> R<Value> {
     let ws = env.ws_for(a.workspace.as_deref())?.clone();
     // Orphaned leases whose files are clean go now (daemon-and-cli.md section 5).
     let all = store::leases_ws(env.c, &ws.row.id)?;
-    let orphans: Vec<&store::LeaseRow> = all.iter().filter(|l| l.state == LeaseState::Orphaned).collect();
-    let dirty = engine::dirty_of(env, &ws, &orphans);
     let mut released = Vec::new();
+    let mut gone = HashSet::new();
+    for l in all.iter().filter(|l| !l.is_prefix) {
+        let r = env.resolve(&ws.abs(&l.root, &l.path));
+        for pr in engine::release_if_excluded(env, &r)? {
+            gone.insert((l.root.clone(), l.path_key.clone()));
+            released.push(pr);
+        }
+    }
+    let orphans: Vec<&store::LeaseRow> = all
+        .iter()
+        .filter(|l| l.state == LeaseState::Orphaned && !gone.contains(&(l.root.clone(), l.path_key.clone())))
+        .collect();
+    let dirty = engine::dirty_of(env, &ws, &orphans);
     for l in orphans {
         if l.is_prefix || l.repo.is_none() || !dirty.contains(&(l.root.clone(), l.path_key.clone())) {
             engine::release(env, l, "orphan_clean", None)?;

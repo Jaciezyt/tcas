@@ -15,14 +15,14 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspace(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT, opened_by TEXT NOT NULL,
-  created_at INTEGER NOT NULL);
+  created_at INTEGER NOT NULL, git_hooks INTEGER);
 CREATE TABLE IF NOT EXISTS root(
   workspace TEXT NOT NULL, name TEXT NOT NULL, ord INTEGER NOT NULL, path TEXT NOT NULL UNIQUE,
   case_insensitive INTEGER NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL,
   PRIMARY KEY(workspace, name));
 CREATE TABLE IF NOT EXISTS repo(
   workspace TEXT NOT NULL, root TEXT NOT NULL, dir TEXT NOT NULL, kind TEXT NOT NULL,
-  common_dir TEXT, last_branch TEXT, seen_at INTEGER NOT NULL,
+  common_dir TEXT, last_branch TEXT, branch_changed_at INTEGER, seen_at INTEGER NOT NULL,
   PRIMARY KEY(workspace, root, dir));
 CREATE TABLE IF NOT EXISTS session(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, state TEXT NOT NULL, pid INTEGER,
@@ -57,7 +57,28 @@ CREATE TABLE IF NOT EXISTS outside_edit(
 CREATE TABLE IF NOT EXISTS event(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, workspace TEXT, session TEXT,
   agent TEXT, type TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS commit_seen(
+  hash TEXT NOT NULL, workspace TEXT NOT NULL, root TEXT NOT NULL, repo TEXT NOT NULL,
+  by TEXT, at INTEGER NOT NULL, result TEXT NOT NULL,
+  PRIMARY KEY(workspace, root, repo, hash));
 "#;
+
+/// Columns added after the first schema, for databases created before them.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("workspace", "git_hooks", "INTEGER"),
+    ("repo", "branch_changed_at", "INTEGER"),
+];
+
+fn add_missing_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, col, ty) in ADDED_COLUMNS {
+        let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let have: Vec<String> = st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()?;
+        if !have.iter().any(|c| c == col) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"))?;
+        }
+    }
+    Ok(())
+}
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
@@ -65,6 +86,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let _: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(SCHEMA)?;
+    add_missing_columns(&conn)?;
     let v: Option<String> =
         conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional()?;
     if v.is_none() {
@@ -80,6 +102,8 @@ pub struct WsRow {
     pub mode: Option<String>,
     pub opened_by: String,
     pub created_at: i64,
+    /// Opened with `--no-git-hooks`.
+    pub no_git_hooks: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +125,7 @@ pub struct RepoRow {
     pub kind: String,
     pub common_dir: Option<String>,
     pub last_branch: Option<String>,
+    pub branch_changed_at: Option<i64>,
     pub seen_at: i64,
 }
 
@@ -138,11 +163,20 @@ pub struct LeaseRow {
 }
 
 fn ws_row(r: &Row) -> rusqlite::Result<WsRow> {
-    Ok(WsRow { id: r.get(0)?, name: r.get(1)?, mode: r.get(2)?, opened_by: r.get(3)?, created_at: r.get(4)? })
+    Ok(WsRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        mode: r.get(2)?,
+        opened_by: r.get(3)?,
+        created_at: r.get(4)?,
+        no_git_hooks: r.get::<_, Option<i64>>(5)? == Some(0),
+    })
 }
 
 pub fn workspaces(c: &Connection) -> rusqlite::Result<Vec<WsRow>> {
-    let mut st = c.prepare("SELECT id, name, mode, opened_by, created_at FROM workspace ORDER BY created_at, id")?;
+    let mut st = c.prepare(
+        "SELECT id, name, mode, opened_by, created_at, git_hooks FROM workspace ORDER BY created_at, id",
+    )?;
     st.query_map([], ws_row)?.collect()
 }
 
@@ -175,7 +209,7 @@ pub fn insert_root(c: &Connection, r: &RootRow) -> rusqlite::Result<()> {
 
 pub fn repos(c: &Connection, ws: &str) -> rusqlite::Result<Vec<RepoRow>> {
     let mut st = c.prepare(
-        "SELECT workspace, root, dir, kind, common_dir, last_branch, seen_at FROM repo WHERE workspace=?1 ORDER BY root, dir",
+        "SELECT workspace, root, dir, kind, common_dir, last_branch, branch_changed_at, seen_at FROM repo WHERE workspace=?1 ORDER BY root, dir",
     )?;
     st.query_map([ws], |r| {
         Ok(RepoRow {
@@ -185,7 +219,8 @@ pub fn repos(c: &Connection, ws: &str) -> rusqlite::Result<Vec<RepoRow>> {
             kind: r.get(3)?,
             common_dir: r.get(4)?,
             last_branch: r.get(5)?,
-            seen_at: r.get(6)?,
+            branch_changed_at: r.get(6)?,
+            seen_at: r.get(7)?,
         })
     })?
     .collect()

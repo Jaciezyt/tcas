@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+pub mod session;
+#[allow(unused_imports)]
+pub use session::*;
+
 pub const TCAS: &str = env!("CARGO_BIN_EXE_tcas");
 
 pub struct T {
@@ -30,14 +34,37 @@ impl Run {
 }
 
 pub fn git(dir: &Path, args: &[&str]) {
-    let o = Command::new("git")
-        .args(["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+    let r = user_git(dir, args, &[]);
+    assert_eq!(r.code, 0, "git {args:?}:\n{}\n{}", r.out, r.err);
+}
+
+/// git run by the user in a terminal: no session variables (the tests
+/// themselves may run inside one).
+pub fn user_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut c = Command::new("git");
+    c.args(["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        .env_remove("TCAS_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("TCAS_ALLOW")
+        .stdin(Stdio::null());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let o = c.output().unwrap();
+    Run {
+        code: o.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&o.stdout).into_owned(),
+        err: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+pub fn git_text(dir: &Path, args: &[&str]) -> String {
+    let r = user_git(dir, args, &[]);
+    assert_eq!(r.code, 0, "git {args:?}:\n{}\n{}", r.out, r.err);
+    r.out
 }
 
 impl T {

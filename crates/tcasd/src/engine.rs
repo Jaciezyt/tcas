@@ -9,7 +9,7 @@ use serde_json::json;
 
 use tcas_core::acquire::{self as dec, Held, Want};
 use tcas_core::lease::{self, HolderFacts, LeaseFacts, LeaseState, Limits, Source, Why, Yield};
-use tcas_core::proto::{AcquireResult, BlockerView, Granted, LeaseView, Outcome, PathRef, TooBig};
+use tcas_core::proto::{AcquireResult, BlockerView, Granted, LeaseView, Outcome, PathRef, TooBig, UnmanagedReason};
 use tcas_core::{abspath, brief, relpath};
 
 use crate::daemon::{Caller, Daemon, Fail, Global, R};
@@ -276,6 +276,24 @@ pub fn release(env: &Env, l: &LeaseRow, reason: &str, by: Option<&str>) -> R<()>
     Ok(())
 }
 
+/// Releases any non-prefix lease on `r.abs` when git now excludes it
+/// (leases.md section 3).
+pub fn release_if_excluded(env: &Env, r: &Resolved) -> R<Vec<PathRef>> {
+    if !matches!(r.unmanaged, Some(UnmanagedReason::GitExcluded { .. })) {
+        return Ok(vec![]);
+    }
+    let Some((ws, root)) = env.world.root_of(&r.abs) else { return Ok(vec![]) };
+    let key = relpath::key(&abspath::relative(&root.path, &r.abs), root.ci);
+    let mut released = Vec::new();
+    for l in store::leases_ws(env.c, &ws.row.id)? {
+        if l.root == root.name && !l.is_prefix && l.path_key == key {
+            release(env, &l, "excluded", None)?;
+            released.push(ws.path_ref(&l.root, &l.path, false));
+        }
+    }
+    Ok(released)
+}
+
 fn yield_reason(why: Why) -> &'static str {
     match why {
         Why::Implicit | Why::GraceOver => "yielded",
@@ -289,6 +307,7 @@ fn yield_reason(why: Why) -> &'static str {
 /// Session end (leases.md section 6, "会话结束").
 pub fn end_session(env: &Env, sid: &str, reason: &str) -> R<()> {
     env.c.execute("DELETE FROM open_call WHERE session=?1", [sid])?;
+    crate::reconcile::drop_session(env.d, sid);
     let leases = store::leases_session(env.c, sid)?;
     let mut by_ws: BTreeMap<String, Vec<&LeaseRow>> = BTreeMap::new();
     for l in &leases {
@@ -369,7 +388,10 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
                     managed.push((r, m));
                 }
             }
-            None => acq.result.unmanaged.extend(r.unmanaged_view()),
+            None => {
+                release_if_excluded(env, &r)?;
+                acq.result.unmanaged.extend(r.unmanaged_view());
+            }
         }
     }
     if managed.is_empty() {
@@ -512,7 +534,7 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
         // requested or waited for (harness.md section 6). An implicit lease
         // follows the file and is taken again by the next edit.
         let alive = ctx.sessions.get(&l.session).is_some_and(|s| s.state != "ended");
-        if alive && matches!(why, Why::Expired | Why::Committed) {
+        if alive && matches!(why, Why::Expired | Why::Committed | Why::GraceOver) {
             yielded_to_notify.entry(l.session.clone()).or_default().push((ws.display(&l.root, &l.path, l.is_prefix), reason));
         }
     }

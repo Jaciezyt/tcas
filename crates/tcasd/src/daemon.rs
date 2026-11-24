@@ -119,6 +119,8 @@ pub struct Daemon {
     pub started_at: i64,
     pub pid: i32,
     pub socket: PathBuf,
+    /// Bash reconcile windows, in memory only (harness.md section 7).
+    pub windows: Mutex<crate::reconcile::Windows>,
 }
 
 pub fn load_global(home: &Home) -> Global {
@@ -147,6 +149,11 @@ impl Daemon {
 
     pub fn waits(&self) -> MutexGuard<'_, Waits> {
         self.waits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Taken after the database lock, never before it.
+    pub fn windows(&self) -> MutexGuard<'_, crate::reconcile::Windows> {
+        self.windows.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The global configuration, re-read when the file changed. The second

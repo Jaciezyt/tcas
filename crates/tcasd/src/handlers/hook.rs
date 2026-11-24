@@ -10,13 +10,13 @@ use serde_json::{Value, json};
 use tcas_core::config::Mode;
 use tcas_core::lease::Source;
 use tcas_core::proto::{HookRequest, HookResponse, HookTool, Outcome, ProcId, Request};
-use tcas_core::{abspath, brief, exempt, lease, relpath};
+use tcas_core::{abspath, brief, exempt, guard, lease, relpath, shell};
 use tcas_sys::fsys;
 
 use super::args;
 use crate::daemon::{self, Caller, Fail, R, Seen};
 use crate::engine::{self, AcqReq, Env};
-use crate::store;
+use crate::{bashguard, reconcile, store};
 use crate::text::{self, Viewer};
 
 pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
@@ -47,7 +47,7 @@ pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
             "prompt" => prompt(env, &sid, &h)?,
             "pre_tool" => pre_tool(env, &sid, &h)?,
             "post_tool" => post_tool(env, &sid, &h)?,
-            "stop" => stop(env, &sid)?,
+            "stop" => stop(env, &sid, &h)?,
             "agent_stop" => agent_stop(env, &sid, &h)?,
             other => return Err(Fail::bad(format!("hook: unknown event {other:?}"))),
         }
@@ -106,6 +106,7 @@ fn take_over(env: &Env, sid: &str, h: &HookRequest) -> R<Option<String>> {
             params![o.id, sid],
         )?;
         env.c.execute("DELETE FROM open_call WHERE session=?1", [&o.id])?;
+        reconcile::drop_session(env.d, &o.id);
         env.c.execute("DELETE FROM interest WHERE session=?1", [&o.id])?;
         if o.state != "ended" {
             env.c.execute("UPDATE session SET state='ended', ended_at=?2 WHERE id=?1", params![o.id, env.now])?;
@@ -131,6 +132,7 @@ fn session_end(env: &mut Env, sid: &str, h: &HookRequest) -> R<()> {
         // dirty files are orphaned as usual, so they read right if it never
         // comes.
         env.c.execute("DELETE FROM open_call WHERE session=?1", [sid])?;
+        reconcile::drop_session(env.d, sid);
         env.c.execute("DELETE FROM interest WHERE session=?1", [sid])?;
         let leases = store::leases_session(env.c, sid)?;
         for ws in env.world.wss.clone() {
@@ -164,16 +166,22 @@ fn prompt(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
 }
 
 /// The main agent's turn ended (leases.md section 6): its calls are closed
-/// and the session is idle until its next hook.
-fn stop(env: &mut Env, sid: &str) -> R<HookResponse> {
-    env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL", [sid])?;
+/// and the session is idle until its next hook. Background commands that
+/// are no longer running have their windows closed (harness.md section 5.3).
+fn stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
+    let mut rep = reconcile::Reported::default();
+    reconcile::close_foreground(env, sid, None, &mut rep)?;
+    reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?;
+    env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND background_id IS NULL", [sid])?;
     env.c.execute("UPDATE session SET state='idle' WHERE id=?1 AND state!='ended'", [sid])?;
     Ok(HookResponse::default())
 }
 
 fn agent_stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     if let Some(a) = &h.agent {
-        env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent=?2", params![sid, a])?;
+        let mut rep = reconcile::Reported::default();
+        reconcile::close_foreground(env, sid, Some(a), &mut rep)?;
+        env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent=?2 AND background_id IS NULL", params![sid, a])?;
     }
     Ok(HookResponse::default())
 }
@@ -184,8 +192,32 @@ fn agent_stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
 fn pre_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     match &h.tool {
         Some(t) if t.kind == "edit" => pre_edit(env, sid, h, t),
+        Some(t) if t.kind == "bash" => pre_bash(env, sid, h, t),
         _ => Ok(HookResponse::default()),
     }
+}
+
+/// A Bash call before it runs (harness.md sections 5.1, 5.2 and 5.5): the
+/// command guard, then the reconcile window. A lone `tcas` command opens
+/// no window.
+fn pre_bash(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookResponse> {
+    let Some(command) = t.command.as_deref().filter(|c| !c.trim().is_empty()) else { return Ok(HookResponse::default()) };
+    let cwd = fsys::to_str(&env.cwd);
+    if let Some(r) = bashguard::check(env, sid, command, &cwd)? {
+        bashguard::record(env, sid, &r, command)?;
+        return Ok(deny(r.reason));
+    }
+    let home = tcas_sys::home::user_home().map(|h| fsys::to_str(&h));
+    if guard::tcas_command(&shell::parse(command, &cwd, home.as_deref())).is_some() {
+        return Ok(HookResponse::default());
+    }
+    reconcile::open(env, sid, h.agent.as_deref(), &t.call_id, command)?;
+    env.c.execute(
+        "INSERT OR REPLACE INTO open_call(session, agent, call_id, kind, paths, background_id, opened_at) \
+         VALUES(?1,?2,?3,'bash',NULL,NULL,?4)",
+        params![sid, h.agent, t.call_id, env.now],
+    )?;
+    Ok(HookResponse::default())
 }
 
 /// The paths only the user may change (harness.md section 4 step 1).
@@ -222,6 +254,8 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
         if let Some(m) = r.managed {
             ws_id.get_or_insert(m.ws);
             inputs.push(r.abs);
+        } else {
+            engine::release_if_excluded(env, &r)?;
         }
     }
     let Some(ws_id) = ws_id else { return Ok(HookResponse::default()) };
@@ -253,6 +287,7 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
                  VALUES(?1,?2,?3,'edit',?4,NULL,?5)",
                 params![sid, h.agent, t.call_id, serde_json::to_string(&inputs).unwrap(), env.now],
             )?;
+            reconcile::edited(env.d, sid, &inputs, env.now);
             let foreign: Vec<String> =
                 acq.result.granted.iter().filter(|g| g.foreign_changes).map(|g| g.path.display.clone()).collect();
             if !foreign.is_empty() {
@@ -283,10 +318,31 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
 fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     let mut extra = Vec::new();
     if let Some(t) = &h.tool {
-        env.c.execute("DELETE FROM open_call WHERE session=?1 AND call_id=?2", params![sid, t.call_id])?;
+        let bg = t.background_id.as_deref().filter(|_| t.kind == "bash" && t.background && !t.failed);
+        match bg {
+            // A background command started: its window stays open under the
+            // task ID (harness.md section 5.3).
+            Some(id) => {
+                env.c.execute(
+                    "UPDATE open_call SET background_id=?3 WHERE session=?1 AND call_id=?2",
+                    params![sid, t.call_id, id],
+                )?;
+                reconcile::to_background(env.d, sid, &t.call_id, id);
+            }
+            None => {
+                env.c.execute("DELETE FROM open_call WHERE session=?1 AND call_id=?2", params![sid, t.call_id])?;
+            }
+        }
         match t.kind.as_str() {
             "edit" if !t.failed => extra.extend(outside(env, sid, t)?),
             "read" => touch(env, sid, &t.paths)?,
+            "bash" => {
+                let mut rep = reconcile::Reported::default();
+                if bg.is_none() {
+                    extra.extend(reconcile::close(env, sid, &t.call_id, &mut rep)?);
+                }
+                extra.extend(reconcile::roll_background(env, sid, &mut rep)?);
+            }
             _ => {}
         }
     }

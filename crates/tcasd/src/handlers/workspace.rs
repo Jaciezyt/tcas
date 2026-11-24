@@ -17,6 +17,7 @@ use tcas_sys::{fsys, home::user_home};
 use super::args;
 use crate::daemon::{Caller, Fail, R};
 use crate::engine::{self, Env};
+use crate::githooks;
 use crate::repos::{self, Found};
 use crate::store::{self, RootRow};
 use crate::world::Ws;
@@ -48,6 +49,7 @@ pub fn view(env: &Env, ws: &Ws) -> R<WorkspaceView> {
                 display: ws.display(&r.root, &r.dir, true),
                 kind: r.kind.clone(),
                 branch: r.last_branch.clone(),
+                branch_changed_at: r.branch_changed_at,
                 abs: ws.abs(&r.root, &r.dir),
             })
             .collect(),
@@ -157,12 +159,12 @@ fn canonical(env: &Env, input: &str) -> R<PathBuf> {
     fsys::canonical_dir(&p).map_err(|e| Fail::bad(format!("{input}: {e}")))
 }
 
-struct Discovered {
-    found: Vec<Found>,
-    outside: Vec<(PathBuf, Option<String>)>,
+pub struct Discovered {
+    pub found: Vec<Found>,
+    pub outside: Vec<(PathBuf, Option<String>)>,
 }
 
-fn discover(env: &Env, dir: &Path, ci: bool, depth: usize, ws_exempt: &[tcas_core::exempt::ExemptDir], extra_roots: &[(String, bool)]) -> Discovered {
+pub fn discover(env: &Env, dir: &Path, ci: bool, depth: usize, ws_exempt: &[tcas_core::exempt::ExemptDir], extra_roots: &[(String, bool)]) -> Discovered {
     let mut all_roots: Vec<(String, bool)> =
         env.world.wss.iter().flat_map(|w| w.roots.iter().map(|r| (r.path.clone(), r.ci))).collect();
     all_roots.extend(extra_roots.iter().cloned());
@@ -172,8 +174,16 @@ fn discover(env: &Env, dir: &Path, ci: bool, depth: usize, ws_exempt: &[tcas_cor
     Discovered { found: d.found, outside: d.outside }
 }
 
-/// Replaces the repo rows of one root, with events for what appeared or went.
-fn store_repos(env: &Env, ws_id: &str, root: &str, found: &[Found]) -> R<()> {
+/// tcas's git hooks go into this workspace's checkouts (harness.md section 5.6).
+pub fn hooks_wanted(env: &Env, ws: &Ws) -> bool {
+    !ws.row.no_git_hooks && ws.cfg.git_hooks.enabled && githooks::supported(&env.d.git)
+}
+
+/// Replaces the repo rows of one root, with events for what appeared or
+/// went. Hooks are installed in new checkouts, or in all of them with
+/// `install_all` (opening and adding, which the user asked for). A branch
+/// that differs from the one last seen is reported (harness.md section 5.2).
+pub fn store_repos(env: &Env, ws_id: &str, root: &str, found: &[Found], install_all: bool) -> R<()> {
     let ws = env.world.ws(ws_id);
     let old: Vec<store::RepoRow> =
         store::repos(env.c, ws_id)?.into_iter().filter(|r| r.root == root).collect();
@@ -190,17 +200,75 @@ fn store_repos(env: &Env, ws_id: &str, root: &str, found: &[Found]) -> R<()> {
             }
         }
     }
+    let hooks = ws.is_some_and(|w| hooks_wanted(env, w));
     for f in found {
-        let existed = old.iter().any(|o| o.dir == f.dir);
+        let before = old.iter().find(|o| o.dir == f.dir);
+        let prev_changed = before.and_then(|o| o.branch_changed_at);
         env.c.execute(
-            "INSERT OR REPLACE INTO repo(workspace, root, dir, kind, common_dir, last_branch, seen_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![ws_id, root, f.dir, f.kind, f.common_dir, f.branch, env.now],
+            "INSERT OR REPLACE INTO repo(workspace, root, dir, kind, common_dir, last_branch, branch_changed_at, seen_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ws_id, root, f.dir, f.kind, f.common_dir, f.branch, prev_changed, env.now],
         )?;
-        if !existed {
+        if let (Some(ws), Some(o)) = (ws, before)
+            && o.last_branch.is_some()
+            && f.branch.is_some()
+            && o.last_branch != f.branch
+        {
+            crate::reconcile::branch_changed(env, ws, root, &f.dir, o.last_branch.as_deref(), f.branch.as_deref(), None)?;
+        }
+        if before.is_none() {
             env.event(Some(ws_id), env.caller.session(), "repo.found", json!({ "root": root, "dir": f.dir, "kind": f.kind }))?;
+        }
+        if hooks
+            && (install_all || before.is_none())
+            && let Some(ws) = ws
+        {
+            let abs = ws.repo_abs(root, &f.dir);
+            match githooks::install(&env.d.git, &env.d.home, &abs) {
+                Ok(true) => env.event(Some(ws_id), None, "git_hooks.installed", json!({ "repo": fsys::to_str(&abs) }))?,
+                Ok(false) => {}
+                Err(e) => crate::daemon::log(format!("git hooks in {}: {e}", abs.display())),
+            }
         }
     }
     Ok(())
+}
+
+/// Takes tcas's hooks out of checkouts no longer in any workspace. A
+/// repository's checkouts share one configuration, so the line stays while
+/// another of them is still in a workspace (harness.md section 5.6). Call
+/// after the rows are gone.
+pub fn remove_hooks(env: &Env, gone: &[(PathBuf, Option<String>)]) -> R<()> {
+    let remaining: HashSet<String> = store::all_repos(env.c)?.into_iter().filter_map(|r| r.common_dir).collect();
+    let mut done: HashSet<String> = HashSet::new();
+    for (abs, common) in gone {
+        if let Some(c) = common
+            && (remaining.contains(c) || !done.insert(c.clone()))
+        {
+            continue;
+        }
+        let target = if abs.join(".git").exists() {
+            abs.clone()
+        } else if let Some(c) = common.as_ref().filter(|c| Path::new(c).is_dir()) {
+            PathBuf::from(c)
+        } else {
+            continue;
+        };
+        match githooks::remove(&env.d.git, &env.d.home, &target) {
+            Ok(true) => env.event(None, None, "git_hooks.removed", json!({ "repo": fsys::to_str(abs) }))?,
+            Ok(false) => {}
+            Err(e) => crate::daemon::log(format!("git hooks in {}: {e}", abs.display())),
+        }
+    }
+    Ok(())
+}
+
+fn repo_paths(ws: &Ws, root: Option<&str>) -> Vec<(PathBuf, Option<String>)> {
+    ws.repos
+        .iter()
+        .filter(|r| root.is_none_or(|n| r.root == n))
+        .map(|r| (ws.repo_abs(&r.root, &r.dir), r.common_dir.clone()))
+        .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -275,7 +343,7 @@ pub fn open(env: &mut Env, req: &Request) -> R<Value> {
         let mut outside = Vec::new();
         for r in &ws.roots {
             let found = discover(env, Path::new(&r.path), r.ci, ws.cfg.repos.scan_depth, &ws.exempt, &[]);
-            store_repos(env, &id, &r.name, &found.found)?;
+            store_repos(env, &id, &r.name, &found.found, true)?;
             outside.extend(found.outside);
         }
         env.reload()?;
@@ -344,9 +412,10 @@ pub fn open(env: &mut Env, req: &Request) -> R<Value> {
     let taken: Vec<String> = env.world.wss.iter().map(|w| w.row.name.clone()).collect();
     let name = unique(&base_name(&first), &taken);
     let mode = if a.strict { Some(Mode::Strict.as_str().to_string()) } else { None };
+    let git_hooks: Option<i64> = if a.no_git_hooks { Some(0) } else { None };
     env.c.execute(
-        "INSERT INTO workspace(id, name, mode, opened_by, created_at) VALUES(?1,?2,?3,?4,?5)",
-        params![id, name, mode, env.caller.label(), env.now],
+        "INSERT INTO workspace(id, name, mode, opened_by, created_at, git_hooks) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![id, name, mode, env.caller.label(), env.now, git_hooks],
     )?;
     let mut root_names: Vec<String> = Vec::new();
     for (i, d) in dirs.iter().enumerate() {
@@ -374,7 +443,7 @@ pub fn open(env: &mut Env, req: &Request) -> R<Value> {
     env.reload()?;
     let mut outside = Vec::new();
     for (d, rname) in discovered.into_iter().zip(&root_names) {
-        store_repos(env, &id, rname, &d.found)?;
+        store_repos(env, &id, rname, &d.found, true)?;
         outside.extend(d.outside);
     }
     env.reload()?;
@@ -467,7 +536,7 @@ pub fn add(env: &mut Env, req: &Request) -> R<Value> {
             json!({ "root": rname, "path": fsys::to_str(d), "by": env.caller.label() }),
         )?;
         env.reload()?;
-        store_repos(env, &ws.row.id, &rname, &found.found)?;
+        store_repos(env, &ws.row.id, &rname, &found.found, true)?;
         outside.extend(found.outside);
         added.push(rname);
     }
@@ -491,7 +560,9 @@ pub fn remove_root(env: &Env, ws: &Ws, r: &RootRow, reason: &str) -> R<()> {
     }
     env.c.execute("DELETE FROM repo WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
     env.c.execute("DELETE FROM interest WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
+    env.c.execute("DELETE FROM unattributed WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
     env.c.execute("DELETE FROM root WHERE workspace=?1 AND name=?2", params![ws.row.id, r.name])?;
+    remove_hooks(env, &repo_paths(ws, Some(&r.name)))?;
     env.event(
         Some(&ws.row.id),
         env.caller.session(),
@@ -560,6 +631,7 @@ pub fn close_ws(env: &Env, ws: &Ws, reason: &str) -> R<usize> {
         env.c.execute(&format!("DELETE FROM {t} WHERE workspace=?1"), [&ws.row.id])?;
     }
     env.c.execute("DELETE FROM workspace WHERE id=?1", [&ws.row.id])?;
+    remove_hooks(env, &repo_paths(ws, None))?;
     env.event(
         Some(&ws.row.id),
         env.caller.session(),

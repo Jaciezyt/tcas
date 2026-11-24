@@ -44,7 +44,7 @@ pub fn run(harness: &str) -> i32 {
 pub struct Local {
     pub home: Home,
     /// `home` with symlinks resolved.
-    home_real: String,
+    pub home_real: String,
     pub wss: Vec<WsEntry>,
     pub exempt: Vec<exempt::ExemptDir>,
 }

@@ -63,6 +63,13 @@ pub struct Git {
     strip: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Status {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub entries: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exclusion {
     pub source: String,
@@ -82,6 +89,11 @@ fn run_with_input(mut c: Command, input: &[u8]) -> Option<Output> {
     let out = child.wait_with_output().ok();
     let _ = writer.join();
     out
+}
+
+/// How a detached HEAD is shown, the same wherever it is computed.
+pub fn detached(full_hash: &str) -> String {
+    format!("(detached at {})", &full_hash[..full_hash.len().min(7)])
 }
 
 fn pathspec(rel: &str, ci: bool) -> String {
@@ -147,9 +159,118 @@ impl Git {
         if o.status.success() && !s.is_empty() {
             return Some(s);
         }
-        let o = self.run(repo, &["rev-parse", "--short", "HEAD"])?;
+        let o = self.run(repo, &["rev-parse", "HEAD"])?;
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if o.status.success() && !s.is_empty() { Some(format!("(detached at {s})")) } else { None }
+        if o.status.success() && !s.is_empty() { Some(detached(&s)) } else { None }
+    }
+
+    /// The value of a configuration key as the checkout at `dir` sees it.
+    pub fn config_get(&self, dir: &Path, key: &str) -> Option<String> {
+        let o = self.run(dir, &["config", "--get", key])?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string())
+    }
+
+    /// `name` names a commit (a branch, tag or hash).
+    pub fn is_commit(&self, dir: &Path, name: &str) -> bool {
+        self.run(dir, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{name}^{{commit}}")])
+            .is_some_and(|o| o.status.success())
+    }
+
+    pub fn head(&self, repo: &Path) -> Option<String> {
+        let o = self.run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (o.status.success() && !s.is_empty()).then_some(s)
+    }
+
+    fn names(&self, repo: &Path, args: &[&str]) -> Vec<String> {
+        let Some(o) = self.run(repo, args) else { return vec![] };
+        if !o.status.success() {
+            return vec![];
+        }
+        o.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
+    }
+
+    /// Paths staged in the checkout's index, relative to it.
+    pub fn staged(&self, repo: &Path) -> Vec<String> {
+        self.names(repo, &["diff", "--cached", "--name-only", "-z", "--no-renames"])
+    }
+
+    /// Paths that differ between two commits.
+    pub fn diff_names(&self, repo: &Path, from: &str, to: &str) -> Vec<String> {
+        self.names(repo, &["diff", "--name-only", "-z", "--no-renames", from, to, "--"])
+    }
+
+    /// Paths a commit changed (against its first parent, or everything for a root commit).
+    pub fn commit_paths(&self, repo: &Path, hash: &str) -> Vec<String> {
+        self.names(repo, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", "--no-renames", hash, "--"])
+    }
+
+    /// Commits reachable from `to` and not from `from`, oldest first (at most 100).
+    pub fn rev_list(&self, repo: &Path, from: &str, to: &str) -> Vec<String> {
+        let Some(o) = self.run(repo, &["rev-list", "--reverse", "--max-count=100", &format!("{from}..{to}"), "--"]) else {
+            return vec![];
+        };
+        String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).filter(|s| !s.is_empty()).collect()
+    }
+
+    /// The whole checkout's state in one `git status` (harness.md section
+    /// 5.2): `HEAD`, the branch, and (XY, path relative to `repo`) for every
+    /// changed path; untracked files are `??`. Submodules count only when
+    /// their recorded commit differs.
+    pub fn status_full(&self, repo: &Path) -> Option<Status> {
+        let o = self
+            .cmd(repo)
+            .args([
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--ignore-submodules=dirty",
+            ])
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let mut st = Status::default();
+        let mut detached_head = false;
+        let mut it = o.stdout.split(|b| *b == 0);
+        while let Some(rec) = it.next() {
+            let s = String::from_utf8_lossy(rec);
+            let field = |n: usize| s.splitn(n + 1, ' ').nth(n).map(str::to_string);
+            if let Some(h) = s.strip_prefix("# branch.oid ") {
+                if h != "(initial)" {
+                    st.head = Some(h.to_string());
+                }
+            } else if let Some(b) = s.strip_prefix("# branch.head ") {
+                if b == "(detached)" {
+                    detached_head = true;
+                } else {
+                    st.branch = Some(b.to_string());
+                }
+            } else if s.starts_with("1 ") {
+                if let (Some(xy), Some(p)) = (field(1), field(8)) {
+                    st.entries.push((xy.chars().take(2).collect(), p));
+                }
+            } else if s.starts_with("2 ") {
+                if let (Some(xy), Some(p)) = (field(1), field(9)) {
+                    st.entries.push((xy.chars().take(2).collect(), p));
+                }
+                it.next();
+            } else if s.starts_with("u ") {
+                if let (Some(xy), Some(p)) = (field(1), field(10)) {
+                    st.entries.push((xy.chars().take(2).collect(), p));
+                }
+            } else if let Some(p) = s.strip_prefix("? ") {
+                st.entries.push(("??".into(), p.to_string()));
+            }
+        }
+        if detached_head && let Some(h) = &st.head {
+            st.branch = Some(detached(h));
+        }
+        Some(st)
     }
 
     /// Which of `rels` (relative to `repo`; directories with `is_dir`) git

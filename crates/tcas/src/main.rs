@@ -1,6 +1,8 @@
 //! The `tcas` command (daemon-and-cli.md section 5).
 
 mod client;
+mod commit;
+mod githook;
 mod hook;
 mod out;
 mod plugin;
@@ -71,9 +73,36 @@ enum Cmd {
     /// Harness plugins.
     #[command(subcommand)]
     Plugin(PluginCmd),
+    /// Commit only this session's changed files, one commit per checkout.
+    Commit {
+        #[arg(short = 'm', long = "message")]
+        message: String,
+        /// Files or directories; by default every file this session changed.
+        paths: Vec<String>,
+    },
+    /// Install, remove or show tcas's git hooks in a checkout.
+    #[command(name = "git-hooks", subcommand)]
+    GitHooks(GitHooksCmd),
     /// Called by a harness hook with the event on stdin.
     #[command(hide = true)]
     Hook { harness: String },
+    /// Called by git's hooks.
+    #[command(name = "git-hook", hide = true)]
+    GitHook {
+        name: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitHooksCmd {
+    /// Install them (user only).
+    Install { repo: Option<String> },
+    /// Remove them (user only).
+    Remove { repo: Option<String> },
+    /// Whether they are installed.
+    Status { repo: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -215,18 +244,18 @@ enum DaemonCmd {
     Run,
 }
 
-struct Ctx {
+pub struct Ctx {
     c: Client,
     o: Out,
     json: bool,
 }
 
-fn print_json(v: &Value) {
+pub fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
 impl Ctx {
-    fn fail(&self, code: &str, message: &str) -> i32 {
+    pub fn fail(&self, code: &str, message: &str) -> i32 {
         if self.json {
             print_json(&json!({ "ok": false, "error": { "code": code, "message": message } }));
         } else {
@@ -243,7 +272,7 @@ impl Ctx {
         Err(self.fail(&e.code, &e.message))
     }
 
-    fn call(&self, op: &str, args: Value) -> Result<Value, i32> {
+    pub fn call(&self, op: &str, args: Value) -> Result<Value, i32> {
         match self.c.call(op, args) {
             Ok(r) => self.answer(r),
             Err(m) => Err(self.fail("unavailable", &m)),
@@ -292,6 +321,7 @@ fn main() {
             return;
         }
         Cmd::Hook { harness } => std::process::exit(hook::run(harness)),
+        Cmd::GitHook { name, args } => std::process::exit(githook::run(name, args)),
         Cmd::Plugin(PluginCmd::Path { harness }) => std::process::exit(plugin::path(harness, cli.json)),
         _ => {}
     }
@@ -319,7 +349,37 @@ fn run(x: &Ctx, cmd: Cmd) -> Result<i32, i32> {
             log(x, base, follow)?
         }
         Cmd::Daemon(d) => daemon(x, d)?,
-        Cmd::Hook { .. } | Cmd::Plugin(_) => unreachable!("handled in main"),
+        Cmd::Hook { .. } | Cmd::GitHook { .. } | Cmd::Plugin(_) => unreachable!("handled in main"),
+        Cmd::Commit { message, paths } => commit::run(x, &message, paths)?,
+        Cmd::GitHooks(g) => {
+            let (op, repo) = match g {
+                GitHooksCmd::Install { repo } => ("git_hooks.install", repo),
+                GitHooksCmd::Remove { repo } => ("git_hooks.remove", repo),
+                GitHooksCmd::Status { repo } => ("git_hooks.status", repo),
+            };
+            let repo = repo.map(|r| {
+                let p = std::path::Path::new(&r);
+                if p.is_absolute() { r } else { x.c.cwd.join(p).to_string_lossy().into_owned() }
+            });
+            let v = x.call(op, json!({ "repo": repo }))?;
+            x.emit_plain(v, |v| {
+                if v.get("supported").and_then(Value::as_bool) == Some(false) {
+                    println!("this git does not run hooks defined in its configuration; tcas's git hooks are not used.");
+                }
+                for r in v["repos"].as_array().into_iter().flatten() {
+                    let repo = x.o.tilde(r["repo"].as_str().unwrap_or("?"));
+                    let state = match (op, r["installed"].as_bool(), r["changed"].as_bool()) {
+                        ("git_hooks.install", _, Some(true)) => "installed",
+                        ("git_hooks.install", _, _) => "already installed",
+                        ("git_hooks.remove", _, Some(true)) => "removed",
+                        ("git_hooks.remove", _, _) => "not installed",
+                        (_, Some(true), _) => "installed",
+                        _ => "not installed",
+                    };
+                    println!("{repo}: {state}");
+                }
+            })
+        }
         Cmd::Whoami => {
             let v = x.call("whoami", json!({}))?;
             x.emit_plain(v, |v| {

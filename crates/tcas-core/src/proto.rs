@@ -66,11 +66,14 @@ pub mod code {
     pub const USER_ONLY: &str = "user_only";
     /// The caller is the user, and the command is for sessions.
     pub const SESSION_ONLY: &str = "session_only";
+    /// `tcas commit` was given a path that is not under the session's leases.
+    pub const LEASE_DENIED: &str = "lease_denied";
     pub const INTERNAL: &str = "internal";
 
     pub fn exit_code(code: &str) -> i32 {
         match code {
             USER_ONLY => 6,
+            LEASE_DENIED => 3,
             _ => 1,
         }
     }
@@ -271,6 +274,8 @@ pub struct RepoView {
     pub display: String,
     pub kind: String,
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_changed_at: Option<i64>,
     pub abs: String,
 }
 
@@ -495,4 +500,74 @@ pub struct HookResponse {
     /// session_start: variables for the session's environment.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// git hooks and `tcas commit` (harness.md sections 5.4 and 5.6)
+
+/// Arguments of `git.hook`, sent by `tcas git-hook`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitHookArgs {
+    /// `pre-commit`, `post-commit`, `pre-rebase`, `stash` (from
+    /// reference-transaction), `post-checkout`, `post-merge`, `post-rewrite`.
+    pub hook: String,
+    /// The checkout's root (the hook's working directory).
+    pub repo: String,
+    /// The hook's own arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// pre-commit: the paths in the commit; post-commit: the paths it
+    /// changed. Relative to the checkout.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// post-commit: the new commit.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// `TCAS_ALLOW` was set (it counts only for the user).
+    #[serde(default)]
+    pub allow: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitHookAnswer {
+    pub allow: bool,
+    /// Printed on stderr, refused or not.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// One checkout's part of a `tcas commit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitRepo {
+    /// The checkout as shown (`web`, `.`).
+    pub display: String,
+    pub abs: String,
+    /// Relative to the checkout.
+    pub paths: Vec<String>,
+    /// The same paths as shown in the workspace.
+    pub shown: Vec<String>,
+    /// tcas's git hooks are installed: the commit is reported by them.
+    pub hooks: bool,
+}
+
+/// Result of `commit.prepare`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitPlan {
+    /// In the order to commit (by path).
+    pub repos: Vec<CommitRepo>,
+    /// Held files without uncommitted changes that were asked for.
+    #[serde(default)]
+    pub clean: Vec<String>,
+    /// Held files outside every checkout: never committed.
+    #[serde(default)]
+    pub outside_repo: Vec<String>,
+}
+
+/// Result of `commit.done` (and of the post-commit hook's processing).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitDone {
+    pub released: Vec<PathRef>,
+    /// The committer's leases afterwards.
+    #[serde(default)]
+    pub still_held: Vec<PathRef>,
 }
