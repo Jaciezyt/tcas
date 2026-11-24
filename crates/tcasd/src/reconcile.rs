@@ -570,7 +570,10 @@ fn reconcile(env: &Env, sid: &str, w: &Window, after: &[RepoSnap], rep: &mut Rep
             let rel = relpath::join(&b.dir, p);
             let key = relpath::key(&rel, b.ci);
             let abs = ws.abs(&b.root, &rel);
-            if exempt::find(&env.g.exempt, &abs).is_some() || exempt::find(&ws.exempt, &abs).is_some() {
+            if exempt::find(&env.g.exempt, &abs).is_some()
+                || exempt::find(&ws.exempt, &abs).is_some()
+                || ws.find_unmanaged(&b.root, &rel).is_some()
+            {
                 continue;
             }
             let dirty = a.entries.contains_key(p);

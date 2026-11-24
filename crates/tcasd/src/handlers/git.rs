@@ -286,13 +286,13 @@ pub fn process_commit(env: &Env, ws: &Ws, root: &str, dir: &str, hash: &str, pat
         let is_clean = clean.contains(&l.path_key);
         if mine {
             if is_clean && (l.source.is_implicit() || l.source == tcas_core::lease::Source::Wait) {
-                engine::release(env, &l, "commit", by)?;
+                engine::release_with_commit(env, &l, "commit", by, Some(hash))?;
                 released.push(ws.path_ref(&l.root, &l.path, false));
             } else {
                 committed(env, &l)?;
             }
         } else if is_clean && left_behind(env, &l)? {
-            engine::release(env, &l, "orphan_clean", by)?;
+            engine::release_with_commit(env, &l, "orphan_clean", by, Some(hash))?;
             released.push(ws.path_ref(&l.root, &l.path, false));
         }
     }

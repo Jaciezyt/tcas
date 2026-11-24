@@ -121,6 +121,8 @@ pub struct Daemon {
     pub socket: PathBuf,
     /// Bash reconcile windows, in memory only (harness.md section 7).
     pub windows: Mutex<crate::reconcile::Windows>,
+    /// Last written `workspaces.json` payload, to skip redundant disk writes.
+    pub last_wsjson: Mutex<Option<String>>,
 }
 
 pub fn load_global(home: &Home) -> Global {

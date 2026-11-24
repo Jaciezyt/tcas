@@ -2,13 +2,14 @@
 //! `tcas hook <harness>` (daemon-and-cli.md section 4, harness.md sections
 //! 2 to 7). Nothing here knows which harness sent it.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::params;
 use serde_json::{Value, json};
 
 use tcas_core::config::Mode;
-use tcas_core::lease::Source;
+use tcas_core::lease::{LeaseState, Source};
 use tcas_core::proto::{HookRequest, HookResponse, HookTool, Outcome, ProcId, Request};
 use tcas_core::{abspath, brief, exempt, guard, lease, relpath, shell};
 use tcas_sys::fsys;
@@ -16,8 +17,9 @@ use tcas_sys::fsys;
 use super::args;
 use crate::daemon::{self, Caller, Fail, R, Seen};
 use crate::engine::{self, AcqReq, Env};
+use crate::store::LeaseRow;
+use crate::text::{self, OtherSessionIntro, Viewer};
 use crate::{bashguard, reconcile, store};
-use crate::text::{self, Viewer};
 
 pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
     let h: HookRequest = args(req)?;
@@ -66,7 +68,103 @@ fn deny(reason: String) -> HookResponse {
 // ---------------------------------------------------------------------------
 // Session events
 
+fn session_workspaces(env: &Env, sid: &str, extra_paths: &[String]) -> R<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut push = |id: String| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    if let Some(ws) = env.world.by_cwd(&env.cwd) {
+        push(ws.row.id.clone());
+    }
+    for p in extra_paths {
+        if let Some((ws, _)) = env.world.root_of(p) {
+            push(ws.row.id.clone());
+        }
+    }
+    for l in store::leases_session(env.c, sid)? {
+        push(l.workspace);
+    }
+    Ok(ids)
+}
+
+fn has_session_ws(env: &Env, sid: &str, ws_id: &str) -> R<bool> {
+    let n: i64 = env.c.query_row(
+        "SELECT COUNT(*) FROM session_ws WHERE session=?1 AND workspace=?2",
+        params![sid, ws_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn format_lease_item(ws: &crate::world::Ws, l: &LeaseRow) -> String {
+    let disp = ws.display(&l.root, &l.path, l.is_prefix);
+    let mut s = if l.is_prefix { format!("{disp} (directory)") } else { disp };
+    if l.state == LeaseState::Orphaned {
+        s.push_str(" (orphaned)");
+    }
+    s
+}
+
+fn intro_if_needed(env: &Env, sid: &str, ws_ids: &[String], out: &mut Vec<String>) -> R<()> {
+    if ws_ids.is_empty() {
+        return Ok(());
+    }
+    let session = store::session(env.c, sid)?;
+    let sessions: BTreeMap<String, store::SessionRow> =
+        store::sessions(env.c)?.into_iter().map(|s| (s.id.clone(), s)).collect();
+    let v = Viewer::new(&env.cwd, env.now);
+    let cwd_str = fsys::to_str(&env.cwd);
+    for ws_id in ws_ids {
+        if has_session_ws(env, sid, ws_id)? {
+            continue;
+        }
+        let Some(ws) = env.world.ws(ws_id) else { continue };
+        let mode = ws.mode(env.g.cfg.defaults.mode);
+        let just_opened = session.as_ref().is_some_and(|s| ws.row.created_at > s.started_at);
+        let cur_root = ws.roots.iter().find(|r| abspath::contains(&r.path, &cwd_str, r.ci)).map(|r| r.name.as_str());
+        let other_roots: Vec<String> = ws
+            .roots
+            .iter()
+            .filter(|r| Some(r.name.as_str()) != cur_root)
+            .map(|r| v.path(&r.path, false))
+            .collect();
+        let repos: Vec<String> = ws.repos.iter().map(|r| ws.display(&r.root, &r.dir, true)).collect();
+        let all_leases = store::leases_ws(env.c, ws_id)?;
+        let mut by_other: BTreeMap<String, Vec<&LeaseRow>> = BTreeMap::new();
+        let mut mine = Vec::new();
+        for l in &all_leases {
+            if l.session == sid {
+                mine.push(format_lease_item(ws, l));
+            } else {
+                by_other.entry(l.session.clone()).or_default().push(l);
+            }
+        }
+        let others: Vec<OtherSessionIntro> = by_other
+            .into_iter()
+            .map(|(other_sid, ls)| {
+                let s = sessions.get(&other_sid);
+                let brief = s
+                    .and_then(|s| s.brief.clone())
+                    .or_else(|| ls.iter().find_map(|l| l.brief.clone()));
+                let leases = ls.into_iter().map(|l| format_lease_item(ws, l)).collect();
+                OtherSessionIntro { session: other_sid, brief, leases }
+            })
+            .collect();
+        out.push(text::workspace_intro(mode, just_opened, &other_roots, &repos, &others, &mine));
+        env.c.execute(
+            "INSERT OR IGNORE INTO session_ws(session, workspace, introduced_at) VALUES(?1,?2,?3)",
+            params![sid, ws_id, env.now],
+        )?;
+    }
+    Ok(())
+}
+
 fn session_start(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
+    if matches!(h.source.as_deref(), Some("compact" | "resume" | "clear")) {
+        env.c.execute("DELETE FROM session_ws WHERE session=?1", [sid])?;
+    }
     let mut first = Vec::new();
     if h.source.as_deref() == Some("clear")
         && h.pid > 0
@@ -74,6 +172,8 @@ fn session_start(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     {
         first.push(t);
     }
+    let ws_ids = session_workspaces(env, sid, &[])?;
+    intro_if_needed(env, sid, &ws_ids, &mut first)?;
     Ok(with_context(deliver(env, sid, first)?))
 }
 
@@ -108,6 +208,9 @@ fn take_over(env: &Env, sid: &str, h: &HookRequest) -> R<Option<String>> {
         env.c.execute("DELETE FROM open_call WHERE session=?1", [&o.id])?;
         reconcile::drop_session(env.d, &o.id);
         env.c.execute("DELETE FROM interest WHERE session=?1", [&o.id])?;
+        env.c.execute("DELETE FROM session_ws WHERE session=?1", [&o.id])?;
+        env.c.execute("DELETE FROM read_hint WHERE session=?1 OR holder=?1", [&o.id])?;
+        env.c.execute("DELETE FROM wait_notified WHERE waiter=?1 OR holder=?1", [&o.id])?;
         if o.state != "ended" {
             env.c.execute("UPDATE session SET state='ended', ended_at=?2 WHERE id=?1", params![o.id, env.now])?;
             env.event(None, Some(&o.id), "session.ended", json!({ "reason": "replaced", "by": sid }))?;
@@ -162,7 +265,10 @@ fn prompt(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     {
         env.c.execute("UPDATE session SET title=?2 WHERE id=?1 AND title IS NULL", params![sid, title])?;
     }
-    Ok(with_context(deliver(env, sid, vec![])?))
+    let mut extra = Vec::new();
+    let ws_ids = session_workspaces(env, sid, &[])?;
+    intro_if_needed(env, sid, &ws_ids, &mut extra)?;
+    Ok(with_context(deliver(env, sid, extra)?))
 }
 
 /// The main agent's turn ended (leases.md section 6): its calls are closed
@@ -260,7 +366,8 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
     }
     let Some(ws_id) = ws_id else { return Ok(HookResponse::default()) };
     let ws = env.world.ws(&ws_id).cloned().ok_or_else(|| Fail::bad("workspace vanished"))?;
-    let strict = ws.mode(env.g.cfg.defaults.mode) == Mode::Strict;
+    let mode = ws.mode(env.g.cfg.defaults.mode);
+    let strict = mode == Mode::Strict;
     let req = AcqReq { session: sid, inputs: &inputs, source: Source::Edit, brief: None, check_size: false, record_denial: true };
 
     let acq = if strict {
@@ -272,7 +379,13 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
         if acq.result.outcome == Outcome::Granted && !new.is_empty() {
             env.c.execute_batch("ROLLBACK TO strict_edit; RELEASE strict_edit")?;
             env.event(Some(&ws_id), Some(sid), "edit.refused", json!({ "paths": inputs, "why": "strict" }))?;
-            return Ok(deny(text::strict(&v, &new)));
+            let mut reason = text::strict(&v, &new);
+            if !has_session_ws(env, sid, &ws_id)? {
+                let just_opened = store::session(env.c, sid)?.is_some_and(|s| ws.row.created_at > s.started_at);
+                reason.push('\n');
+                reason.push_str(&text::late_denial_note(mode, just_opened));
+            }
+            return Ok(deny(reason));
         }
         env.c.execute_batch("RELEASE strict_edit")?;
         acq
@@ -297,7 +410,12 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
         }
         Outcome::Denied => {
             let c = env.c;
-            let d = text::denial(&v, &acq.result, |s| store::session(c, s).ok().flatten().and_then(|s| s.ended_at));
+            let mut d = text::denial(&v, &acq.result, |s| store::session(c, s).ok().flatten().and_then(|s| s.ended_at));
+            if !has_session_ws(env, sid, &ws_id)? {
+                let just_opened = store::session(env.c, sid)?.is_some_and(|s| ws.row.created_at > s.started_at);
+                d.reason.push('\n');
+                d.reason.push_str(&text::late_denial_note(mode, just_opened));
+            }
             Ok(HookResponse {
                 decision: Some("deny".into()),
                 reason: Some(d.reason),
@@ -317,6 +435,9 @@ fn pre_edit(env: &mut Env, sid: &str, h: &HookRequest, t: &HookTool) -> R<HookRe
 
 fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     let mut extra = Vec::new();
+    let tool_paths: Vec<String> = h.tool.as_ref().map(|t| t.paths.clone()).unwrap_or_default();
+    let ws_ids = session_workspaces(env, sid, &tool_paths)?;
+    intro_if_needed(env, sid, &ws_ids, &mut extra)?;
     if let Some(t) = &h.tool {
         let bg = t.background_id.as_deref().filter(|_| t.kind == "bash" && t.background && !t.failed);
         match bg {
@@ -334,8 +455,16 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
             }
         }
         match t.kind.as_str() {
-            "edit" if !t.failed => extra.extend(outside(env, sid, t)?),
-            "read" => touch(env, sid, &t.paths)?,
+            "edit" if !t.failed => {
+                extra.extend(outside(env, sid, t)?);
+                extra.extend(suggest_acquire(env, sid, t)?);
+            }
+            "read" => {
+                touch(env, sid, &t.paths)?;
+                if !t.failed && t.name.as_deref() == Some("Read") {
+                    extra.extend(read_hints(env, sid, &t.paths)?);
+                }
+            }
             "bash" => {
                 let mut rep = reconcile::Reported::default();
                 if bg.is_none() {
@@ -347,6 +476,137 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
         }
     }
     Ok(with_context(deliver(env, sid, extra)?))
+}
+
+/// Hints when reading a file another session holds (harness.md section 6,
+/// "读取提示"). Emitted once per (reader, workspace, root, file, holder).
+fn read_hints(env: &Env, sid: &str, paths: &[String]) -> R<Vec<String>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let r = env.resolve(p);
+        let Some(m) = r.managed else { continue };
+        if r.is_dir {
+            continue;
+        }
+        let Some(ws) = env.world.ws(&m.ws) else { continue };
+        let leases = store::leases_ws(env.c, &m.ws)?;
+        let mut by_holder: BTreeMap<String, LeaseRow> = BTreeMap::new();
+        for l in leases {
+            if l.session == sid || l.root != m.root {
+                continue;
+            }
+            if !lease::covers(&l.path_key, l.is_prefix, &m.key, false) {
+                continue;
+            }
+            // Prefer the file lease over its enclosing directory lease.
+            by_holder
+                .entry(l.session.clone())
+                .and_modify(|cur| {
+                    if cur.is_prefix && !l.is_prefix {
+                        *cur = l.clone();
+                    }
+                })
+                .or_insert(l);
+        }
+        let file_disp = ws.display(&m.root, &m.rel, false);
+        let interest_path = relpath::display(&m.rel, false);
+        for (holder, l) in by_holder {
+            let inserted = env.c.execute(
+                "INSERT OR IGNORE INTO read_hint(session, workspace, root, path_key, holder, seen_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![sid, m.ws, m.root, m.key, holder, env.now],
+            )?;
+            if inserted == 0 {
+                continue;
+            }
+            env.c.execute(
+                "INSERT OR IGNORE INTO interest(session, workspace, root, path, kind) VALUES(?1,?2,?3,?4,'read')",
+                params![sid, m.ws, m.root, interest_path],
+            )?;
+            let hs = store::session(env.c, &holder)?;
+            let ended = l.state == LeaseState::Orphaned || hs.as_ref().is_some_and(|s| s.state == "ended");
+            let (brief_text, from_user) = match (&l.brief, hs.as_ref().and_then(|s| s.brief.as_ref())) {
+                (Some(b), _) => (Some(b.as_str()), l.source == Source::Grant),
+                (None, Some(b)) => (Some(b.as_str()), false),
+                (None, None) => (None, false),
+            };
+            let dir = if l.is_prefix { Some(ws.display(&l.root, &l.path, true)) } else { None };
+            out.push(text::read_hint(&file_disp, &holder, dir.as_deref(), brief_text, from_user, ended));
+        }
+    }
+    Ok(out)
+}
+
+/// Reminds the session once after editing `hint_after_files` implicit files
+/// without requesting leases first (harness.md section 6, "先申请的提醒").
+fn suggest_acquire(env: &Env, sid: &str, t: &HookTool) -> R<Vec<String>> {
+    let Some(s) = store::session(env.c, sid)? else { return Ok(vec![]) };
+    if s.suggested_at.is_some() {
+        return Ok(vec![]);
+    }
+    let mut ws_ids = Vec::new();
+    for p in &t.paths {
+        if let Some((ws, _)) = env.world.root_of(p)
+            && !ws_ids.contains(&ws.row.id)
+        {
+            ws_ids.push(ws.row.id.clone());
+        }
+    }
+    if ws_ids.is_empty()
+        && let Some(ws) = env.world.by_cwd(&env.cwd)
+    {
+        ws_ids.push(ws.row.id.clone());
+    }
+    let mine = store::leases_session(env.c, sid)?;
+    let v = Viewer::new(&env.cwd, env.now);
+    for ws_id in ws_ids {
+        let Some(ws) = env.world.ws(&ws_id) else { continue };
+        let threshold = ws.cfg.brief.hint_after_files;
+        if threshold == 0 {
+            continue;
+        }
+        let dirs: Vec<&LeaseRow> = mine.iter().filter(|l| l.workspace == ws_id && l.is_prefix).collect();
+        let implicit: Vec<&LeaseRow> = mine
+            .iter()
+            .filter(|l| l.workspace == ws_id && !l.is_prefix && l.source.is_implicit())
+            .filter(|l| !dirs.iter().any(|d| d.root == l.root && relpath::contains(&d.path_key, &l.path_key)))
+            .collect();
+        if implicit.len() < threshold {
+            continue;
+        }
+        let mut groups: BTreeMap<(String, Option<String>), Vec<&LeaseRow>> = BTreeMap::new();
+        for l in &implicit {
+            groups.entry((l.root.clone(), l.repo.clone())).or_default().push(l);
+        }
+        let mut cmd_dirs = Vec::new();
+        let mut all_valid = true;
+        for ((root, _repo), group) in groups {
+            let common = relpath::common_dir(group.iter().map(|l| l.path.as_str()));
+            if common.is_empty() || engine::tracked_under(env, ws, &root, &common).len() as u64 > ws.cfg.lease.max_dir_files {
+                all_valid = false;
+                break;
+            }
+            cmd_dirs.push(v.arg(&ws.path_ref(&root, &common, true)));
+        }
+        let command = if all_valid && !cmd_dirs.is_empty() {
+            Some(format!(
+                "tcas lease acquire {} --brief \"<one line: what you are changing and why>\"",
+                cmd_dirs.join(" ")
+            ))
+        } else {
+            None
+        };
+        let shown: Vec<String> = implicit.iter().map(|l| ws.display(&l.root, &l.path, false)).collect();
+        env.c.execute("UPDATE session SET suggested_at=?2 WHERE id=?1", params![sid, env.now])?;
+        env.event(
+            Some(&ws_id),
+            Some(sid),
+            "lease.suggested",
+            json!({ "count": implicit.len(), "paths": shown, "command": command }),
+        )?;
+        return Ok(vec![text::suggest_acquire(&shown, command.as_deref())]);
+    }
+    Ok(vec![])
 }
 
 /// An edit outside every workspace, in a git checkout, by a session whose

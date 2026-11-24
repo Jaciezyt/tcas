@@ -73,6 +73,7 @@ pub fn run(home: Home) -> Result<(), String> {
         pid: std::process::id() as i32,
         socket: sock.clone(),
         windows: Mutex::new(Default::default()),
+        last_wsjson: Mutex::new(None),
     }));
     {
         let g = d.global();

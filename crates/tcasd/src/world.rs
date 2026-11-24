@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use tcas_core::config::{Mode, WorkspaceConfig};
 use tcas_core::exempt::{self, ExemptDir};
 use tcas_core::proto::{PathRef, Unmanaged, UnmanagedReason};
+use tcas_core::unmanaged::{self, UnmanagedRule};
 use tcas_core::{abspath, relpath};
 use tcas_sys::fsys;
 
@@ -20,8 +21,13 @@ pub struct Ws {
     pub roots: Vec<RootRow>,
     pub repos: Vec<RepoRow>,
     pub cfg: WorkspaceConfig,
-    /// Exempt directories from the roots' `.tcas.toml`.
+    /// Exempt directories from the roots' and nested repos' `.tcas.toml`.
     pub exempt: Vec<ExemptDir>,
+    /// Unmanaged file patterns from the roots' and nested repos' `.tcas.toml`.
+    pub unmanaged: Vec<UnmanagedRule>,
+    unmanaged_roots: Vec<String>,
+    /// `.tcas.toml` parse errors in this workspace.
+    pub problems: Vec<String>,
 }
 
 impl Ws {
@@ -74,6 +80,14 @@ impl Ws {
     pub fn first_root_path(&self) -> &str {
         self.roots.first().map(|r| r.path.as_str()).unwrap_or("")
     }
+
+    pub fn find_unmanaged(&self, root: &str, rel: &str) -> Option<&UnmanagedRule> {
+        self.unmanaged
+            .iter()
+            .zip(&self.unmanaged_roots)
+            .find(|(rule, r_name)| r_name.as_str() == root && unmanaged::matches_rule(rule, rel))
+            .map(|(rule, _)| rule)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,18 +113,56 @@ impl World {
             let rs: Vec<RootRow> = roots.iter().filter(|r| r.workspace == row.id).cloned().collect();
             let repos = store::repos(c, &row.id)?;
             let first = rs.first().map(|r| PathBuf::from(&r.path));
-            let (cfg, _) = first.as_deref().map(read_ws_cfg).unwrap_or_default();
-            let mut ex = Vec::new();
-            for (i, r) in rs.iter().enumerate() {
-                let entries = if i == 0 {
-                    cfg.exempt.clone()
-                } else {
-                    read_ws_cfg(Path::new(&r.path)).0.exempt
-                };
-                let src = format!("workspace: {}/.tcas.toml", r.path);
-                ex.extend(tcas_sys::exempt::workspace_list(Path::new(&r.path), &entries, &src, r.ci));
+            let (cfg, first_err) = first.as_deref().map(read_ws_cfg).unwrap_or_default();
+            let mut problems = Vec::new();
+            if let Some(e) = first_err {
+                problems.push(e);
             }
-            wss.push(Ws { row, roots: rs, repos, cfg, exempt: ex });
+            let mut ex = Vec::new();
+            let mut unmanaged = Vec::new();
+            let mut unmanaged_roots = Vec::new();
+            let mut push_unmanaged = |root_name: &str, base_rel: &str, patterns: &[String], src: &str, ci: bool| {
+                for pat in patterns {
+                    unmanaged.push(UnmanagedRule {
+                        base_rel: base_rel.to_string(),
+                        pattern: pat.clone(),
+                        source: src.to_string(),
+                        ci,
+                    });
+                    unmanaged_roots.push(root_name.to_string());
+                }
+            };
+            for (i, r) in rs.iter().enumerate() {
+                let rcfg = if i == 0 {
+                    cfg.clone()
+                } else {
+                    let (c2, err) = read_ws_cfg(Path::new(&r.path));
+                    if let Some(e) = err {
+                        problems.push(e);
+                    }
+                    c2
+                };
+                let ex_src = format!("workspace: {}/.tcas.toml", r.path);
+                ex.extend(tcas_sys::exempt::workspace_list(Path::new(&r.path), &rcfg.exempt, &ex_src, r.ci));
+                let un_src = format!("{}/.tcas.toml", r.path);
+                push_unmanaged(&r.name, "", &rcfg.unmanaged, &un_src, r.ci);
+            }
+            for repo in &repos {
+                if repo.dir.is_empty() {
+                    continue;
+                }
+                let Some(root_row) = rs.iter().find(|r| r.name == repo.root) else { continue };
+                let repo_abs = Path::new(&root_row.path).join(&repo.dir);
+                let (rcfg, err) = read_ws_cfg(&repo_abs);
+                if let Some(e) = err {
+                    problems.push(e);
+                }
+                let ex_src = format!("repo: {}/.tcas.toml", repo_abs.display());
+                ex.extend(tcas_sys::exempt::workspace_list(&repo_abs, &rcfg.exempt, &ex_src, root_row.ci));
+                let un_src = format!("{}/.tcas.toml", repo_abs.display());
+                push_unmanaged(&repo.root, &repo.dir, &rcfg.unmanaged, &un_src, root_row.ci);
+            }
+            wss.push(Ws { row, roots: rs, repos, cfg, exempt: ex, unmanaged, unmanaged_roots, problems });
         }
         Ok(World { wss })
     }
@@ -242,6 +294,13 @@ pub fn resolve(world: &World, global_exempt: &[ExemptDir], git: &Git, cwd: &Path
                 return r;
             }
         }
+    }
+    if !is_dir && let Some(u) = ws.find_unmanaged(&root.name, &rel) {
+        r.unmanaged = Some(UnmanagedReason::Unmanaged {
+            pattern: u.pattern.clone(),
+            source: u.source.clone(),
+        });
+        return r;
     }
     r.managed = Some(Managed {
         ws: ws.row.id.clone(),

@@ -96,6 +96,7 @@ pub struct PathRef {
 pub enum UnmanagedReason {
     Exempt { dir: String, written: String, source: String },
     GitExcluded { source: String, line: u32, pattern: String },
+    Unmanaged { pattern: String, source: String },
     GitDir,
     OutsideWorkspace,
 }
@@ -570,4 +571,37 @@ pub struct CommitDone {
     /// The committer's leases afterwards.
     #[serde(default)]
     pub still_held: Vec<PathRef>,
+}
+
+/// Per-checkout git hook status for `tcas doctor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorRepo {
+    pub display: String,
+    pub abs: String,
+    pub kind: String,
+    pub branch: Option<String>,
+    pub hooks_installed: bool,
+}
+
+/// Workspace summary returned by the `doctor` daemon op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorWorkspace {
+    pub id: String,
+    pub name: String,
+    pub mode: String,
+    pub roots: Vec<RootView>,
+    pub problems: Vec<String>,
+    pub git_hooks_config: String,
+    pub repos: Vec<DoctorRepo>,
+}
+
+/// Daemon response for the `doctor` op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorDaemonReply {
+    pub daemon: DaemonStatus,
+    pub protocol_version: u32,
+    pub exempt: Vec<ExemptView>,
+    pub problems: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub workspace: Option<DoctorWorkspace>,
 }

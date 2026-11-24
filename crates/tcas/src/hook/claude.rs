@@ -214,10 +214,11 @@ pub fn run(input: &str) -> i32 {
                     }
                 }
                 "Read" | "Grep" => {
-                    if !local.marked(&sid) {
+                    let paths = read_paths(&v, &cwd);
+                    if !(known || paths.iter().any(|p| local.managed(p))) {
                         return 0;
                     }
-                    HookTool { kind: "read".into(), call_id, name: Some(tool_name.clone()), paths: read_paths(&v, &cwd), failed, ..HookTool::default() }
+                    HookTool { kind: "read".into(), call_id, name: Some(tool_name.clone()), paths, failed, ..HookTool::default() }
                 }
                 _ => {
                     if !local.marked(&sid) {

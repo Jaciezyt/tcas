@@ -29,11 +29,13 @@ pub fn check(d: &'static Daemon) {
     };
     for sid in dead {
         let req = Request { v: tcas_core::proto::VERSION, op: "internal.end".into(), session: None, cwd: "/".into(), ancestors: vec![], args: serde_json::Value::Null };
-        let r = handlers::with_tx_inner(d, &req, HashMap::new(), |env| engine::end_session(env, &sid, "process_gone"));
-        if let Err(e) = r {
-            log(format!("ending {sid}: {}", e.message));
-        } else {
-            log(format!("session {sid} ended: process gone"));
+        let r = handlers::with_tx_inner_freed(d, &req, HashMap::new(), |env| engine::end_session(env, &sid, "process_gone"));
+        match r {
+            Err(e) => log(format!("ending {sid}: {}", e.message)),
+            Ok((_, freed)) => {
+                log(format!("session {sid} ended: process gone"));
+                handlers::notify_freed(d, freed);
+            }
         }
     }
     let now = tcas_sys::clock::now_ms();
@@ -50,6 +52,16 @@ pub fn check(d: &'static Daemon) {
     }
     let _ = conn.execute("DELETE FROM notice WHERE session NOT IN (SELECT id FROM session)", []);
     let _ = conn.execute("DELETE FROM outside_edit WHERE session NOT IN (SELECT id FROM session)", []);
+    let _ = conn.execute("DELETE FROM interest WHERE session NOT IN (SELECT id FROM session)", []);
+    let _ = conn.execute("DELETE FROM session_ws WHERE session NOT IN (SELECT id FROM session)", []);
+    let _ = conn.execute(
+        "DELETE FROM read_hint WHERE session NOT IN (SELECT id FROM session) OR holder NOT IN (SELECT id FROM session)",
+        [],
+    );
+    let _ = conn.execute(
+        "DELETE FROM wait_notified WHERE waiter NOT IN (SELECT id FROM session) OR holder NOT IN (SELECT id FROM session)",
+        [],
+    );
     if retention > 0 {
         let _ = conn.execute("DELETE FROM event WHERE at < ?1", [now - retention]);
     }

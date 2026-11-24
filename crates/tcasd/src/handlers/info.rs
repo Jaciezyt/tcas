@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use tcas_core::lease::LeaseState;
 use tcas_core::pathfmt;
-use tcas_core::proto::{DaemonStatus, ExemptView, Request, SessionView, StatusResult};
+use tcas_core::proto::{
+    DaemonStatus, DoctorDaemonReply, DoctorRepo, DoctorWorkspace, ExemptView, Request, RootView, SessionView,
+    StatusResult, VERSION,
+};
 use tcas_core::{abspath, exempt, relpath};
 use tcas_sys::{fsys, home::user_home};
 
@@ -45,14 +48,18 @@ fn unattributed(env: &Env, ws: &Ws, leases: &[store::LeaseRow]) -> Vec<tcas_core
                 continue;
             }
             let abs = ws.abs(&repo.root, &rel);
-            if exempt::find(&env.g.exempt, &abs).is_some() || exempt::find(&ws.exempt, &abs).is_some() {
+            let is_dir = p.ends_with('/');
+            if exempt::find(&env.g.exempt, &abs).is_some()
+                || exempt::find(&ws.exempt, &abs).is_some()
+                || (!is_dir && ws.find_unmanaged(&repo.root, &rel).is_some())
+            {
                 continue;
             }
             let covered = leases.iter().any(|l| {
-                l.root == repo.root && tcas_core::lease::covers(&l.path_key, l.is_prefix, &key, p.ends_with('/'))
+                l.root == repo.root && tcas_core::lease::covers(&l.path_key, l.is_prefix, &key, is_dir)
             });
             if !covered {
-                out.push(ws.path_ref(&repo.root, &rel, p.ends_with('/')));
+                out.push(ws.path_ref(&repo.root, &rel, is_dir));
             }
         }
     }
@@ -190,7 +197,7 @@ pub fn session_end(env: &mut Env, req: &Request) -> R<Value> {
     Ok(json!({ "session": s.id, "released": before - after.len(), "orphaned": orphaned }))
 }
 
-pub fn exempt_list(env: &mut Env) -> R<Value> {
+fn exempt_summary(env: &Env) -> (Vec<ExemptView>, Vec<String>, Vec<String>) {
     let mut out: Vec<ExemptView> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for e in env.g.exempt.iter().chain(env.world.wss.iter().flat_map(|w| w.exempt.iter())) {
@@ -198,7 +205,6 @@ pub fn exempt_list(env: &mut Env) -> R<Value> {
             out.push(ExemptView { path: e.path.clone(), written: e.written.clone(), source: e.source.clone() });
         }
     }
-    // Conflicts with roots, for doctor-like warnings.
     let mut conflicts = Vec::new();
     for ws in &env.world.wss {
         for r in &ws.roots {
@@ -207,7 +213,16 @@ pub fn exempt_list(env: &mut Env) -> R<Value> {
             }
         }
     }
-    Ok(json!({ "entries": out, "problems": env.g.problems, "conflicts": conflicts }))
+    let mut problems = env.g.problems.clone();
+    for ws in &env.world.wss {
+        problems.extend(ws.problems.iter().cloned());
+    }
+    (out, problems, conflicts)
+}
+
+pub fn exempt_list(env: &mut Env) -> R<Value> {
+    let (out, problems, conflicts) = exempt_summary(env);
+    Ok(json!({ "entries": out, "problems": problems, "conflicts": conflicts }))
 }
 
 #[derive(Deserialize, Default)]
@@ -359,9 +374,9 @@ pub fn log(env: &mut Env, req: &Request) -> R<Value> {
     Ok(serde_json::to_value(evs).unwrap())
 }
 
-pub fn daemon_status(env: &mut Env) -> R<Value> {
+fn daemon_status_view(env: &Env) -> R<DaemonStatus> {
     let sessions = store::sessions(env.c)?.iter().filter(|s| s.state != "ended").count();
-    let st = DaemonStatus {
+    Ok(DaemonStatus {
         pid: env.d.pid,
         version: env!("CARGO_PKG_VERSION").into(),
         started_at: env.d.started_at,
@@ -369,8 +384,60 @@ pub fn daemon_status(env: &mut Env) -> R<Value> {
         workspaces: env.world.wss.len(),
         sessions,
         waits: env.waiting.values().map(Vec::len).sum(),
+    })
+}
+
+pub fn daemon_status(env: &mut Env) -> R<Value> {
+    Ok(serde_json::to_value(daemon_status_view(env)?).unwrap())
+}
+
+pub fn doctor(env: &mut Env) -> R<Value> {
+    let daemon = daemon_status_view(env)?;
+    let (exempt, problems, conflicts) = exempt_summary(env);
+    let workspace = env.world.by_cwd(&env.cwd).map(|ws| {
+        let roots = ws
+            .roots
+            .iter()
+            .map(|r| RootView {
+                name: r.name.clone(),
+                path: r.path.clone(),
+                case_insensitive: r.ci,
+                added_by: r.added_by.clone(),
+            })
+            .collect();
+        let repos = ws
+            .repos
+            .iter()
+            .map(|r| {
+                let abs_path = ws.repo_abs(&r.root, &r.dir);
+                DoctorRepo {
+                    display: ws.display(&r.root, &r.dir, true),
+                    abs: ws.abs(&r.root, &r.dir),
+                    kind: r.kind.clone(),
+                    branch: r.last_branch.clone(),
+                    hooks_installed: crate::githooks::installed(&env.d.git, &env.d.home, &abs_path),
+                }
+            })
+            .collect();
+        DoctorWorkspace {
+            id: ws.row.id.clone(),
+            name: ws.row.name.clone(),
+            mode: ws.mode(env.g.cfg.defaults.mode).as_str().into(),
+            roots,
+            problems: ws.problems.clone(),
+            git_hooks_config: fsys::to_str(&env.d.home.git_hooks_config()),
+            repos,
+        }
+    });
+    let reply = DoctorDaemonReply {
+        daemon,
+        protocol_version: VERSION,
+        exempt,
+        problems,
+        conflicts,
+        workspace,
     };
-    Ok(serde_json::to_value(st).unwrap())
+    Ok(serde_json::to_value(reply).unwrap())
 }
 
 pub fn daemon_stop(d: &'static Daemon, req: &Request) -> R<Value> {

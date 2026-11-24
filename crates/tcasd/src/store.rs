@@ -26,8 +26,9 @@ CREATE TABLE IF NOT EXISTS repo(
   PRIMARY KEY(workspace, root, dir));
 CREATE TABLE IF NOT EXISTS session(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, state TEXT NOT NULL, pid INTEGER,
-  pid_started_at INTEGER, cwd TEXT, title TEXT, brief TEXT, started_at INTEGER NOT NULL,
-  last_seen_at INTEGER NOT NULL, ended_at INTEGER);
+  pid_started_at INTEGER, cwd TEXT, title TEXT, brief TEXT, broadcast_brief TEXT,
+  started_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, ended_at INTEGER,
+  suggested_at INTEGER);
 CREATE TABLE IF NOT EXISTS lease(
   workspace TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, path_key TEXT NOT NULL,
   is_prefix INTEGER NOT NULL, repo TEXT, session TEXT NOT NULL, state TEXT NOT NULL,
@@ -47,6 +48,17 @@ CREATE TABLE IF NOT EXISTS interest(
   session TEXT NOT NULL, workspace TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL,
   kind TEXT NOT NULL,
   PRIMARY KEY(session, workspace, root, path, kind));
+CREATE TABLE IF NOT EXISTS session_ws(
+  session TEXT NOT NULL, workspace TEXT NOT NULL, introduced_at INTEGER NOT NULL,
+  PRIMARY KEY(session, workspace));
+CREATE TABLE IF NOT EXISTS read_hint(
+  session TEXT NOT NULL, workspace TEXT NOT NULL, root TEXT NOT NULL, path_key TEXT NOT NULL,
+  holder TEXT NOT NULL, seen_at INTEGER NOT NULL,
+  PRIMARY KEY(session, workspace, root, path_key, holder));
+CREATE TABLE IF NOT EXISTS wait_notified(
+  waiter TEXT NOT NULL, holder TEXT NOT NULL, workspace TEXT NOT NULL, root TEXT NOT NULL,
+  path_key TEXT NOT NULL,
+  PRIMARY KEY(waiter, holder, workspace, root, path_key));
 CREATE TABLE IF NOT EXISTS unattributed(
   workspace TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, seen_at INTEGER NOT NULL,
   PRIMARY KEY(workspace, root, path));
@@ -67,6 +79,8 @@ CREATE TABLE IF NOT EXISTS commit_seen(
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("workspace", "git_hooks", "INTEGER"),
     ("repo", "branch_changed_at", "INTEGER"),
+    ("session", "broadcast_brief", "TEXT"),
+    ("session", "suggested_at", "INTEGER"),
 ];
 
 fn add_missing_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -139,9 +153,11 @@ pub struct SessionRow {
     pub cwd: Option<String>,
     pub title: Option<String>,
     pub brief: Option<String>,
+    pub broadcast_brief: Option<String>,
     pub started_at: i64,
     pub last_seen_at: i64,
     pub ended_at: Option<i64>,
+    pub suggested_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +251,7 @@ pub fn all_repos(c: &Connection) -> rusqlite::Result<Vec<RepoRow>> {
 }
 
 const SESSION_COLS: &str =
-    "id, harness, state, pid, pid_started_at, cwd, title, brief, started_at, last_seen_at, ended_at";
+    "id, harness, state, pid, pid_started_at, cwd, title, brief, broadcast_brief, started_at, last_seen_at, ended_at, suggested_at";
 
 fn session_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -247,9 +263,11 @@ fn session_row(r: &Row) -> rusqlite::Result<SessionRow> {
         cwd: r.get(5)?,
         title: r.get(6)?,
         brief: r.get(7)?,
-        started_at: r.get(8)?,
-        last_seen_at: r.get(9)?,
-        ended_at: r.get(10)?,
+        broadcast_brief: r.get(8)?,
+        started_at: r.get(9)?,
+        last_seen_at: r.get(10)?,
+        ended_at: r.get(11)?,
+        suggested_at: r.get(12)?,
     })
 }
 

@@ -560,6 +560,8 @@ pub fn remove_root(env: &Env, ws: &Ws, r: &RootRow, reason: &str) -> R<()> {
     }
     env.c.execute("DELETE FROM repo WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
     env.c.execute("DELETE FROM interest WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
+    env.c.execute("DELETE FROM read_hint WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
+    env.c.execute("DELETE FROM wait_notified WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
     env.c.execute("DELETE FROM unattributed WHERE workspace=?1 AND root=?2", params![ws.row.id, r.name])?;
     env.c.execute("DELETE FROM root WHERE workspace=?1 AND name=?2", params![ws.row.id, r.name])?;
     remove_hooks(env, &repo_paths(ws, Some(&r.name)))?;
@@ -627,7 +629,7 @@ pub fn close_ws(env: &Env, ws: &Ws, reason: &str) -> R<usize> {
     for l in &leases {
         engine::release(env, l, "workspace_closed", None)?;
     }
-    for t in ["repo", "root", "interest", "unattributed"] {
+    for t in ["repo", "root", "interest", "session_ws", "read_hint", "wait_notified", "unattributed"] {
         env.c.execute(&format!("DELETE FROM {t} WHERE workspace=?1"), [&ws.row.id])?;
     }
     env.c.execute("DELETE FROM workspace WHERE id=?1", [&ws.row.id])?;

@@ -2,6 +2,7 @@
 
 mod client;
 mod commit;
+mod doctor;
 mod githook;
 mod hook;
 mod out;
@@ -68,6 +69,8 @@ enum Cmd {
     /// Start, stop or inspect tcasd.
     #[command(subcommand)]
     Daemon(DaemonCmd),
+    /// Check installation, daemon, workspace, git and harness health.
+    Doctor,
     /// Who tcasd takes this command to come from.
     Whoami,
     /// Harness plugins.
@@ -107,6 +110,8 @@ enum GitHooksCmd {
 
 #[derive(Subcommand)]
 enum PluginCmd {
+    /// Generate and install the plugin for a harness (user only).
+    Install { harness: String },
     /// Print the plugin directory for a harness (writing it if needed), for
     /// `claude --plugin-dir`.
     Path { harness: String },
@@ -349,7 +354,9 @@ fn run(x: &Ctx, cmd: Cmd) -> Result<i32, i32> {
             log(x, base, follow)?
         }
         Cmd::Daemon(d) => daemon(x, d)?,
-        Cmd::Hook { .. } | Cmd::GitHook { .. } | Cmd::Plugin(_) => unreachable!("handled in main"),
+        Cmd::Doctor => doctor::run(x),
+        Cmd::Hook { .. } | Cmd::GitHook { .. } | Cmd::Plugin(PluginCmd::Path { .. }) => unreachable!("handled in main"),
+        Cmd::Plugin(PluginCmd::Install { harness }) => plugin::install(x, &harness)?,
         Cmd::Commit { message, paths } => commit::run(x, &message, paths)?,
         Cmd::GitHooks(g) => {
             let (op, repo) = match g {
@@ -398,7 +405,13 @@ fn workspace(x: &Ctx, w: WsCmd) -> Result<i32, i32> {
     Ok(match w {
         WsCmd::Open { paths, strict, no_git_hooks } => {
             let v = x.call("workspace.open", json!({ "paths": paths, "strict": strict, "no_git_hooks": no_git_hooks }))?;
-            x.emit(v, |o, r: &OpenResult| out::opened(o, r, "open"))
+            let r: OpenResult = serde_json::from_value(v.clone())
+                .map_err(|e| x.fail(code::INTERNAL, &format!("tcasd sent an unexpected answer: {e}")))?;
+            let code = x.emit(v, |o, r: &OpenResult| out::opened(o, r, "open"));
+            if !x.json && !r.already_open && x.c.session.is_none() && r.workspace.opened_by == "user" {
+                plugin::warn_if_missing(&x.c.home);
+            }
+            code
         }
         WsCmd::Add { dirs, workspace } => {
             let v = x.call("workspace.add", json!({ "paths": dirs, "workspace": workspace }))?;

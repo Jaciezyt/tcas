@@ -16,6 +16,18 @@ use crate::daemon::{Caller, Daemon, Fail, Global, R};
 use crate::store::{self, LeaseRow, SessionRow};
 use crate::world::{self, Managed, Resolved, World, Ws};
 
+pub struct Freed {
+    pub workspace: String,
+    pub root: String,
+    pub path: String,
+    pub path_key: String,
+    pub is_prefix: bool,
+    pub display: String,
+    pub holder: String,
+    pub releaser: String,
+    pub commit: Option<String>,
+}
+
 pub struct Env<'a> {
     pub d: &'a Daemon,
     pub c: &'a Connection,
@@ -27,6 +39,8 @@ pub struct Env<'a> {
     /// Sessions waiting, with the paths they wait for (a snapshot taken
     /// before the database lock; waits are always locked first).
     pub waiting: HashMap<String, Vec<String>>,
+    /// Leases released in this transaction that may trigger `lease.freed`.
+    pub freed: std::cell::RefCell<Vec<Freed>>,
 }
 
 impl Env<'_> {
@@ -267,19 +281,50 @@ pub fn lease_view(env: &Env, ws: &Ws, l: &LeaseRow, ctx: &Ctx, dirty: Option<boo
 /// `yielded`, `expired`, `committed_idle`, `session_ended`, `forced`,
 /// `orphan_clean`, `excluded`, `workspace_closed`, `repo_gone`.
 pub fn release(env: &Env, l: &LeaseRow, reason: &str, by: Option<&str>) -> R<()> {
+    release_with_commit(env, l, reason, by, None)
+}
+
+pub fn release_with_commit(env: &Env, l: &LeaseRow, reason: &str, by: Option<&str>, commit: Option<&str>) -> R<()> {
     store::delete_lease(env.c, l)?;
+    env.c.execute(
+        "DELETE FROM read_hint WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
+        params![l.workspace, l.root, l.path_key, l.session],
+    )?;
+    env.c.execute(
+        "DELETE FROM wait_notified WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
+        params![l.workspace, l.root, l.path_key, l.session],
+    )?;
     let mut p = json!({ "root": l.root, "path": l.path, "is_prefix": l.is_prefix, "reason": reason, "source": l.source.as_str() });
     if let Some(b) = by {
         p["by"] = json!(b);
     }
     env.event(Some(&l.workspace), Some(&l.session), "lease.released", p)?;
+    if matches!(reason, "commit" | "released" | "forced" | "session_ended" | "orphan_clean") {
+        let display = env
+            .world
+            .ws(&l.workspace)
+            .map(|w| w.display(&l.root, &l.path, l.is_prefix))
+            .unwrap_or_else(|| relpath::display(&l.path, l.is_prefix));
+        let short = commit.map(|h| h.chars().take(7).collect());
+        env.freed.borrow_mut().push(Freed {
+            workspace: l.workspace.clone(),
+            root: l.root.clone(),
+            path: l.path.clone(),
+            path_key: l.path_key.clone(),
+            is_prefix: l.is_prefix,
+            display,
+            holder: l.session.clone(),
+            releaser: by.unwrap_or(&l.session).to_string(),
+            commit: short,
+        });
+    }
     Ok(())
 }
 
-/// Releases any non-prefix lease on `r.abs` when git now excludes it
-/// (leases.md section 3).
+/// Releases any non-prefix lease on `r.abs` when git excludes it or `.tcas.toml`
+/// marks it `unmanaged` (leases.md section 3).
 pub fn release_if_excluded(env: &Env, r: &Resolved) -> R<Vec<PathRef>> {
-    if !matches!(r.unmanaged, Some(UnmanagedReason::GitExcluded { .. })) {
+    if !matches!(r.unmanaged, Some(UnmanagedReason::GitExcluded { .. } | UnmanagedReason::Unmanaged { .. })) {
         return Ok(vec![]);
     }
     let Some((ws, root)) = env.world.root_of(&r.abs) else { return Ok(vec![]) };
@@ -335,6 +380,9 @@ pub fn end_session(env: &Env, sid: &str, reason: &str) -> R<()> {
     }
     env.c.execute("UPDATE session SET state='ended', ended_at=?2 WHERE id=?1", params![sid, env.now])?;
     env.c.execute("DELETE FROM interest WHERE session=?1", [sid])?;
+    env.c.execute("DELETE FROM session_ws WHERE session=?1", [sid])?;
+    env.c.execute("DELETE FROM read_hint WHERE session=?1 OR holder=?1", [sid])?;
+    env.c.execute("DELETE FROM wait_notified WHERE waiter=?1 OR holder=?1", [sid])?;
     env.event(None, Some(sid), "session.ended", json!({ "reason": reason }))?;
     Ok(())
 }

@@ -51,12 +51,19 @@ pub fn build(world: &World, g: &Global) -> WsJson {
 }
 
 pub fn write(d: &Daemon, world: &World, g: &Global) {
-    let path = d.home.workspaces_json();
-    let tmp = path.with_extension("json.tmp");
     let text = match serde_json::to_string_pretty(&build(world, g)) {
         Ok(t) => t,
         Err(e) => return log(format!("workspaces.json: {e}")),
     };
+    {
+        let mut last = d.last_wsjson.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        *last = Some(text.clone());
+    }
+    let path = d.home.workspaces_json();
+    let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
         log(format!("workspaces.json: {e}"));
     }

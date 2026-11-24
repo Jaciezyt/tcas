@@ -22,7 +22,7 @@ fn edits_take_leases_and_conflicts_are_refused() {
     let t = T::new();
     let app = one_repo(&t);
     let (a, b) = (S::at(&t, "aaaa1111-2222", &app), S::at(&t, "bbbb3333-4444", &app));
-    assert!(a.start("startup").silent());
+    assert!(a.start("startup").context().contains("managed by TCAS"));
     a.prompt("Fix the login redirect loop");
     b.start("startup");
 
@@ -45,6 +45,7 @@ fn edits_take_leases_and_conflicts_are_refused() {
     let r = b.pre_edit(&app.join("a.txt"));
     assert!(r.reason().contains("Their brief: \"Fix the redirect loop\""), "{}", r.reason());
     assert!(r.reason().contains("If their brief already covers the change"), "{}", r.reason());
+    assert!(b.post_other().context().contains("has started work on a.txt"));
 
     // Paths outside every workspace, and git-excluded ones, are not checked.
     let other = t.root.join("elsewhere.txt");
@@ -83,7 +84,7 @@ fn orphans_resume_and_discard() {
     a2.end("other");
 
     git(&app, &["checkout", "--", "a.txt"]);
-    assert!(b.edit(&app.join("a.txt"), "B\n").silent());
+    assert!(!b.edit(&app.join("a.txt"), "B\n").denied());
     assert_eq!(leases(&t)[0].0, "claude:bbbb3333-4444");
 }
 
@@ -216,7 +217,7 @@ fn waited_lease_yields_after_grace() {
 
     std::thread::sleep(Duration::from_millis(2200));
     let r = a.edit(&app.join("a.txt"), "A2\n");
-    assert!(r.silent(), "{}", r.v);
+    assert!(!r.denied(), "{}", r.v);
     assert_eq!(leases(&t), [("claude:aaaa1111-2222".into(), "a.txt".into(), "edit".into(), "active".into())]);
 
     let ctx = b.post_other().context();
@@ -300,7 +301,7 @@ fn explicit_leases_expire_unless_used() {
 
     std::thread::sleep(Duration::from_millis(2200));
     let r = b.edit(&app.join("src/util/z.ts"), "B\n");
-    assert!(r.silent(), "{}", r.v);
+    assert!(!r.denied(), "{}", r.v);
     assert!(!leases(&t).iter().any(|l| l.0.contains("aaaa")));
 
     // A learns at its next hook, first.
@@ -355,7 +356,7 @@ fn directory_leases_and_session_end() {
         assert!(r.reason().contains("Their brief: \"Rename getUser\""), "{}", r.reason());
         assert!(r.reason().contains(&format!("tcas lease wait {p} ")), "the wait names the file: {}", r.reason());
     }
-    assert!(b.edit(&app.join("src/util/z.ts"), "B\n").silent());
+    assert!(!b.edit(&app.join("src/util/z.ts"), "B\n").denied());
 
     a.edit(&app.join("src/auth/x.ts"), "A\n");
     let mine: Vec<String> = leases(&t).into_iter().filter(|l| l.0.contains("aaaa")).map(|l| l.1).collect();
@@ -363,7 +364,9 @@ fn directory_leases_and_session_end() {
     a.end("other");
     let left: Vec<(String, String)> = leases(&t).into_iter().filter(|l| l.0.contains("aaaa")).map(|l| (l.1, l.3)).collect();
     assert_eq!(left, [("src/auth/x.ts".to_string(), "orphaned".to_string())]);
-    assert!(b.edit(&app.join("src/auth/y.ts"), "B\n").silent());
+    let r = b.edit(&app.join("src/auth/y.ts"), "B\n");
+    assert!(!r.denied(), "{}", r.v);
+    assert!(r.context().contains("src/auth/new.ts is now free"), "{}", r.context());
 }
 
 /// Case 41: one session edits in two repositories of one workspace.

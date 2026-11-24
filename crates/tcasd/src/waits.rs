@@ -201,6 +201,7 @@ fn attempt(d: &Daemon, w: &WaitEntry, now: i64) -> R<Attempt> {
         caller: Caller::Session(w.session.clone()),
         cwd: w.cwd.clone(),
         waiting: HashMap::new(),
+        freed: Default::default(),
     };
     let acq = engine::acquire(
         &env,

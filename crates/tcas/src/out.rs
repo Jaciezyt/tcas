@@ -60,6 +60,9 @@ pub fn unmanaged_reason(o: &Out, u: &Unmanaged) -> String {
         UnmanagedReason::GitExcluded { source, line, pattern } => {
             format!("excluded by git ({}:{line}: {pattern})", o.tilde(source))
         }
+        UnmanagedReason::Unmanaged { pattern, source } => {
+            format!("unmanaged pattern {pattern} ({})", o.tilde(source))
+        }
         UnmanagedReason::GitDir => "inside git's own directory (.git/)".into(),
         UnmanagedReason::OutsideWorkspace => "not in any workspace".into(),
     }

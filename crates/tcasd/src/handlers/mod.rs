@@ -6,15 +6,18 @@ pub mod info;
 pub mod lease;
 pub mod workspace;
 
+use std::collections::HashSet;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use rusqlite::params;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tcas_core::proto::{ErrorBody, Request, Response, VERSION, code};
+use tcas_core::relpath;
 
 use crate::daemon::{Daemon, Fail, R, identify};
-use crate::engine::{self, Env};
+use crate::engine::{self, Env, Freed};
 use crate::store;
 use crate::world::World;
 
@@ -56,6 +59,7 @@ pub fn dispatch(d: &'static Daemon, req: Request, stream: &UnixStream) -> Respon
                 "exempt.remove" => info::exempt_remove(env, &req),
                 "log" => info::log(env, &req),
                 "daemon.status" => info::daemon_status(env),
+                "doctor" => info::doctor(env),
                 "whoami" => Ok(json!({ "caller": env.caller.label(), "user": env.caller.is_user() })),
                 "hook" => hook::handle(env, &req),
                 "git.hook" => git::hook(env, &req),
@@ -85,7 +89,9 @@ pub fn canonical_cwd(cwd: &str) -> PathBuf {
 
 pub fn with_tx(d: &'static Daemon, req: &Request, f: impl FnOnce(&mut Env) -> R<Value>) -> R<Value> {
     let waiting = d.waits().summary();
-    with_tx_inner(d, req, waiting, f)
+    let (v, freed) = with_tx_inner_freed(d, req, waiting, f)?;
+    notify_freed(d, freed);
+    Ok(v)
 }
 
 /// Runs `f` in one transaction. The caller may hold the waits lock (waits
@@ -96,6 +102,16 @@ pub fn with_tx_inner<T>(
     waiting: std::collections::HashMap<String, Vec<String>>,
     f: impl FnOnce(&mut Env) -> R<T>,
 ) -> R<T> {
+    let (v, _) = with_tx_inner_freed(d, req, waiting, f)?;
+    Ok(v)
+}
+
+pub fn with_tx_inner_freed<T>(
+    d: &'static Daemon,
+    req: &Request,
+    waiting: std::collections::HashMap<String, Vec<String>>,
+    f: impl FnOnce(&mut Env) -> R<T>,
+) -> R<(T, Vec<Freed>)> {
     let (g, reread) = d.global_checked();
     let mut conn = d.db();
     let tx = conn.transaction()?;
@@ -103,18 +119,102 @@ pub fn with_tx_inner<T>(
     let cwd = canonical_cwd(&req.cwd);
     let caller = identify(&tx, &d.home, req.session.as_deref(), &req.ancestors, &cwd.to_string_lossy(), now)?;
     let world = World::load(&tx)?;
-    let mut env = Env { d, c: &tx, world, g, now, caller, cwd, waiting };
+    let mut env = Env { d, c: &tx, world, g, now, caller, cwd, waiting, freed: Default::default() };
     let changed = housekeeping(&mut env)?;
     let v = f(&mut env)?;
     if changed || reread || req.op.starts_with("workspace.") || req.op.starts_with("exempt.") {
         env.reload()?;
-        crate::wsjson::write(d, &env.world, &env.g);
     }
+    crate::wsjson::write(d, &env.world, &env.g);
+    let freed = std::mem::take(&mut *env.freed.borrow_mut());
     drop(env);
     tx.commit()?;
     drop(conn);
     d.kick();
-    Ok(v)
+    Ok((v, freed))
+}
+
+/// Delivers `lease.freed` notices to interested sessions after releasing locks,
+/// letting waiting sessions take freed paths synchronously first (harness.md
+/// section 6). Never call while holding `d.waits()`.
+pub fn notify_freed(d: &'static Daemon, freed: Vec<Freed>) {
+    if freed.is_empty() {
+        return;
+    }
+    let has_waits = !d.waits().list.is_empty();
+    if has_waits {
+        crate::waits::evaluate(d);
+    }
+    if let Err(e) = notify_freed_db(d, freed) {
+        crate::daemon::log(format!("notify_freed: {}", e.message));
+    }
+}
+
+fn notify_freed_db(d: &'static Daemon, freed: Vec<Freed>) -> R<()> {
+    let mut conn = d.db();
+    let tx = conn.transaction()?;
+    let world = World::load(&tx)?;
+    let now = tcas_sys::clock::now_ms();
+    let mut notified: HashSet<(String, String, String, String)> = HashSet::new();
+    for f in freed {
+        let rows: Vec<(String, String, String)> = {
+            let mut st = tx.prepare("SELECT session, path, kind FROM interest WHERE workspace=?1 AND root=?2")?;
+            st.query_map(params![f.workspace, f.root], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let leases: Vec<store::LeaseRow> =
+            store::leases_ws(&tx, &f.workspace)?.into_iter().filter(|l| l.root == f.root).collect();
+        let ci = world.ws(&f.workspace).map(|w| w.ci(&f.root)).unwrap_or(false);
+        for (int_session, int_path, int_kind) in rows {
+            let int_is_dir = int_path.ends_with('/');
+            let int_rel = if int_path == "." { "" } else { int_path.trim_end_matches('/') };
+            let int_key = relpath::key(int_rel, ci);
+            if !relpath::intersects(&f.path_key, f.is_prefix, &int_key, int_is_dir) {
+                continue;
+            }
+            let covered_by_self = leases.iter().any(|l| {
+                l.session == int_session && tcas_core::lease::covers(&l.path_key, l.is_prefix, &int_key, int_is_dir)
+            });
+            if int_session == f.releaser
+                || int_session == f.holder
+                || covered_by_self
+                || store::session(&tx, &int_session)?.is_none_or(|s| s.state == "ended")
+            {
+                tx.execute(
+                    "DELETE FROM interest WHERE session=?1 AND workspace=?2 AND root=?3 AND path=?4 AND kind=?5",
+                    params![int_session, f.workspace, f.root, int_path, int_kind],
+                )?;
+                continue;
+            }
+            let still_held = leases.iter().any(|l| relpath::intersects(&l.path_key, l.is_prefix, &int_key, int_is_dir));
+            if still_held {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM interest WHERE session=?1 AND workspace=?2 AND root=?3 AND path=?4 AND kind=?5",
+                params![int_session, f.workspace, f.root, int_path, int_kind],
+            )?;
+            if !notified.insert((int_session.clone(), f.workspace.clone(), f.root.clone(), int_path.clone())) {
+                continue;
+            }
+            let shown = world
+                .ws(&f.workspace)
+                .map(|w| w.display(&f.root, int_rel, int_is_dir))
+                .unwrap_or_else(|| int_path.clone());
+            store::notice(
+                &tx,
+                now,
+                &int_session,
+                "lease.freed",
+                json!({ "workspace": f.workspace, "path": shown, "commit": f.commit }),
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Roots and checkouts whose directories are gone (daemon-and-cli.md section 5).

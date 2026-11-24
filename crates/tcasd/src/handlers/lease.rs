@@ -52,10 +52,31 @@ pub fn acquire(env: &mut Env, req: &Request) -> R<Value> {
         return Err(Fail::bad("give the paths to acquire"));
     }
     require_brief(env, &a.paths, &a.brief)?;
+    let prev_broadcast = store::session(env.c, &sid)?.and_then(|s| s.broadcast_brief);
     let acq = engine::acquire(
         env,
         &AcqReq { session: &sid, inputs: &a.paths, source: Source::Cli, brief: a.brief, check_size: true, record_denial: true },
     )?;
+    if acq.result.outcome == Outcome::Granted
+        && !acq.result.granted.is_empty()
+        && let Some(b) = acq.result.brief.clone()
+        && Some(b.as_str()) != prev_broadcast.as_deref()
+        && let Some(ws_id) = &acq.ws
+        && let Some(ws) = env.world.ws(ws_id)
+        && ws.cfg.brief.broadcast
+    {
+        let paths: Vec<String> = acq.result.granted.iter().map(|g| g.path.display.clone()).collect();
+        for (member, state) in super::workspace::members(env, ws)? {
+            if member != sid && state != "ended" {
+                env.notice(
+                    &member,
+                    "lease.started",
+                    json!({ "workspace": ws_id, "by": sid, "paths": paths, "brief": b }),
+                )?;
+            }
+        }
+        env.c.execute("UPDATE session SET broadcast_brief=?2 WHERE id=?1", params![sid, b])?;
+    }
     Ok(serde_json::to_value(acq.result).unwrap())
 }
 
@@ -88,41 +109,53 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
     let a: WaitArgs = args(req)?;
     let mut list = d.waits();
     let summary = list.summary();
-    let (sid, acq, deadline, started_at, cwd, snapshot) = with_tx_inner(d, req, summary, |env| {
-        let sid = env.caller.require_session("tcas lease wait")?.to_string();
-        if a.paths.is_empty() {
-            return Err(Fail::bad("give the paths to wait for"));
-        }
-        let acq = engine::acquire(
-            env,
-            &AcqReq {
-                session: &sid,
-                inputs: &a.paths,
-                source: Source::Wait,
-                brief: a.brief.clone(),
-                check_size: true,
-                record_denial: false,
-            },
-        )?;
-        let ws = acq.ws.as_ref().and_then(|w| env.world.ws(w));
-        let (def, max) = ws.map(|w| (w.cfg.wait.default_timeout_secs, w.cfg.wait.max_timeout_secs)).unwrap_or((1800, 14400));
-        let timeout = a.timeout.unwrap_or(def).min(max) as i64;
-        let started_at = a.started_at.filter(|s| *s <= env.now).unwrap_or(env.now);
-        if acq.result.outcome == Outcome::Granted && !acq.result.wanted.is_empty() {
-            env.event(
-                acq.ws.as_deref(),
-                Some(&sid),
-                "wait.granted",
-                json!({ "paths": acq.result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": env.now - started_at }),
+    let (sid, acq, deadline, started_at, cwd, snapshot, brief_sanitized, holder_keys) =
+        with_tx_inner(d, req, summary, |env| {
+            let sid = env.caller.require_session("tcas lease wait")?.to_string();
+            if a.paths.is_empty() {
+                return Err(Fail::bad("give the paths to wait for"));
+            }
+            let acq = engine::acquire(
+                env,
+                &AcqReq {
+                    session: &sid,
+                    inputs: &a.paths,
+                    source: Source::Wait,
+                    brief: a.brief.clone(),
+                    check_size: true,
+                    record_denial: false,
+                },
             )?;
-        }
-        let snapshot = if acq.result.outcome == Outcome::Denied {
-            acq.result.wanted.iter().filter(|p| !p.is_dir).map(|p| (p.clone(), waits::last_commit(d, &p.abs))).collect()
-        } else {
-            vec![]
-        };
-        Ok((sid, acq, started_at + timeout * 1000, started_at, env.cwd.clone(), snapshot))
-    })?;
+            let ws = acq.ws.as_ref().and_then(|w| env.world.ws(w));
+            let (def, max) = ws.map(|w| (w.cfg.wait.default_timeout_secs, w.cfg.wait.max_timeout_secs)).unwrap_or((1800, 14400));
+            let max_chars = ws.map(|w| w.cfg.brief.max_chars).unwrap_or(200);
+            let brief_sanitized = a.brief.as_deref().and_then(|b| tcas_core::brief::sanitize(b, max_chars));
+            let timeout = a.timeout.unwrap_or(def).min(max) as i64;
+            let started_at = a.started_at.filter(|s| *s <= env.now).unwrap_or(env.now);
+            if acq.result.outcome == Outcome::Granted && !acq.result.wanted.is_empty() {
+                env.event(
+                    acq.ws.as_deref(),
+                    Some(&sid),
+                    "wait.granted",
+                    json!({ "paths": acq.result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": env.now - started_at }),
+                )?;
+            }
+            let snapshot = if acq.result.outcome == Outcome::Denied {
+                acq.result.wanted.iter().filter(|p| !p.is_dir).map(|p| (p.clone(), waits::last_commit(d, &p.abs))).collect()
+            } else {
+                vec![]
+            };
+            let holder_keys: Vec<(String, tcas_core::proto::PathRef, String)> = acq
+                .holders
+                .iter()
+                .map(|(h, _, held)| {
+                    let ci = ws.is_some_and(|w| w.ci(&held.root));
+                    let k = relpath::key(&held.path, ci);
+                    (h.clone(), held.clone(), k)
+                })
+                .collect();
+            Ok((sid, acq, started_at + timeout * 1000, started_at, env.cwd.clone(), snapshot, brief_sanitized, holder_keys))
+        })?;
     let now = tcas_sys::clock::now_ms();
     let mut result = acq.result;
     if result.outcome != Outcome::Denied {
@@ -150,11 +183,22 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
             "wait.deadlock",
             json!({ "paths": r.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "cycle": r.cycle, "at": "registration" }),
         )?;
+        let _ = store::notice(&conn, now, &sid, "wait.deadlock", json!({ "workspace": ws_id, "result": r }));
         return Ok(serde_json::to_value(r).unwrap());
     }
     if now >= deadline {
         result.outcome = Outcome::Timeout;
         result.waited_ms = Some(now - started_at);
+        let conn = d.db();
+        let _ = store::event(
+            &conn,
+            now,
+            Some(&ws_id),
+            Some(&sid),
+            "wait.timeout",
+            json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "waited_ms": now - started_at }),
+        );
+        let _ = store::notice(&conn, now, &sid, "wait.timeout", json!({ "workspace": ws_id, "result": result }));
         return Ok(serde_json::to_value(result).unwrap());
     }
 
@@ -186,6 +230,31 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
             if a.started_at.is_some() { "wait.resumed" } else { "wait.started" },
             json!({ "paths": result.wanted.iter().map(|p| p.display.clone()).collect::<Vec<_>>(), "brief": a.brief }),
         )?;
+        let mut by_holder: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (holder, held, held_key) in &holder_keys {
+            if store::session(&conn, holder)?.is_none_or(|s| s.state == "ended") {
+                continue;
+            }
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO wait_notified(waiter, holder, workspace, root, path_key) VALUES(?1,?2,?3,?4,?5)",
+                params![sid, holder, ws_id, held.root, held_key],
+            )?;
+            if inserted > 0 {
+                let paths = by_holder.entry(holder.clone()).or_default();
+                if !paths.contains(&held.display) {
+                    paths.push(held.display.clone());
+                }
+            }
+        }
+        for (holder, paths) in by_holder {
+            store::notice(
+                &conn,
+                now,
+                &holder,
+                "wait.waiting",
+                json!({ "workspace": ws_id, "by": sid, "paths": paths, "brief": brief_sanitized }),
+            )?;
+        }
     }
     drop(list);
     d.kick();

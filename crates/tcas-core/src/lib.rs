@@ -12,4 +12,5 @@ pub mod pathfmt;
 pub mod proto;
 pub mod relpath;
 pub mod shell;
+pub mod unmanaged;
 pub mod wait;

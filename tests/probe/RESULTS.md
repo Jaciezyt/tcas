@@ -145,3 +145,29 @@ Tool inputs/responses seen:
 - `/clear`: new session_id; order is SessionEnd(reason `clear`, old id) then SessionStart(source `clear`, new id) with the same harness ppid. After `/clear` Bash gets the new `CLAUDE_CODE_SESSION_ID` and `TCAS_SESSION=probe-<new id>` (the SessionStart hook re-ran and wrote the env file). So the harness.md section 2 `/clear` rule is needed.
 - Exit with a running background command: `/exit` shows a dialog "Background work is running ... 1. Exit and stop tasks / 2. Move to background and exit / 3. Stay". Option 1: the command is killed (pid gone 2s later). Option 2: claude exits and the command keeps running to completion (it then has no harness ancestor; its env vars remain). Ctrl-C twice is the other exit path (not measured separately). SessionEnd is logged with reason `prompt_input_exit` for the process that exits.
 - Interactive inherited-env caveat: when launched from inside another Claude Code session, the child warns "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker"; the probe strips `CLAUDE_CODE_*` variables so that does not apply.
+
+## 2026-11-25 — Milestone 4 probes & hook benchmarks (Claude Code 2.1.331)
+
+Isolated probes run with `HOME` and `TCAS_HOME` under `/tmp/tcas-probe-m4` (real `~/.claude` and `~/.tcas` untouched; `/tmp/tcas-probe-m4` removed afterward), `--model haiku` (remapped to `claude-sonnet-5-5`), macOS, `git 2.54.0`.
+
+### Remaining §9 Claude Code probes
+
+| conclusion | expected | observed | result |
+|---|---|---|---|
+| Marketplace install (`tcas plugin install claude`) | marketplace + `tcas@tcas` installed & enabled; cached `bin/tcas` executable | `action="installed"`, `enabled=true`, `cache_bin_executable=true` | PASS |
+| Marketplace-installed plugin fires hooks without `--plugin-dir` (`claude -p`) | `SessionStart` + `PreToolUse` + `PostToolUse` + `SessionEnd` fire; free file leased, held file denied | `a.txt` written & leased; `b.txt` (`claude:other-mkt`) blocked (`lease.denied`, file unchanged) | PASS |
+| Interactive `bypassPermissions` (pty) runs `PreToolUse` and blocks write | `PreToolUse` `deny` blocks `Write` on held `locked.txt` | `lease.denied` logged; `locked.txt` unchanged (`'safe\n'`) | PASS |
+| Interactive `/compact` (pty) fires `SessionStart` with `source="compact"` | `SessionStart` `source="compact"`, same `session_id`, `CLAUDE_ENV_FILE` present | `["compact", "a849441c-71e7-475b-a8a2-49f4fa23ee03", true]` | PASS |
+| `additionalContext` from `SessionStart(compact)` reaches model | model quotes `PROBE-CTX-SessionStart` on next turn | `on screen: True` | PASS |
+
+### Hook & git-hook latency (debug build, 50-file repo, 10 iterations each)
+
+| hook invocation | median (ms) | max (ms) |
+|---|---|---|
+| `tcas hook claude` (`PreToolUse` `Edit`) | 18.6 | 30.0 |
+| `tcas hook claude` (`PostToolUse` `Edit`) | 3.5 | 4.0 |
+| `tcas hook claude` (`PreToolUse` `Bash`) | 12.6 | 47.5 |
+| `tcas hook claude` (`PostToolUse` `Bash`) | 12.2 | 12.9 |
+| `tcas git-hook reference-transaction` (non-stash fast path) | 2.8 | 3.1 |
+| `tcas git-hook pre-commit` | 11.1 | 11.9 |
+
