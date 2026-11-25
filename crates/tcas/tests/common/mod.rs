@@ -88,6 +88,9 @@ impl T {
         let d = self.proj.join(name);
         std::fs::create_dir_all(&d).unwrap();
         git(&d, &["init", "-q", "-b", "main"]);
+        git(&d, &["config", "user.name", "t"]);
+        git(&d, &["config", "user.email", "t@example.com"]);
+        git(&d, &["config", "commit.gpgsign", "false"]);
         for (p, text) in files {
             let f = d.join(p);
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();

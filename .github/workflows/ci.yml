@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build binaries
+        run: cargo build --workspace --bins --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+  plugins:
+    name: Validate plugins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check wrapper scripts
+        run: |
+          for script in plugins/claude/bin/tcas plugins/agy/bin/tcas; do
+            test -x "$script"
+            sh -n "$script"
+          done
+
+      - name: Validate manifests and versions
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, tomllib
+
+          with open("Cargo.toml", "rb") as f:
+              ws_version = tomllib.load(f)["workspace"]["package"]["version"]
+
+          json_files = sorted(pathlib.Path("plugins").rglob("*.json"))
+          assert json_files, "no plugin JSON files found"
+          for path in json_files:
+              with path.open("r", encoding="utf-8") as f:
+                  data = json.load(f)
+              if path.name == "plugin.json":
+                  assert data["version"] == ws_version, (
+                      f"{path}: version {data['version']!r} != workspace {ws_version!r}"
+                  )
+          print(f"Validated {len(json_files)} plugin JSON files (version {ws_version})")
+          PY
