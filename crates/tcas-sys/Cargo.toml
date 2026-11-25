@@ -7,6 +7,9 @@ publish.workspace = true
 rust-version.workspace = true
 description.workspace = true
 homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 tcas-core.workspace = true

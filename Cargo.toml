@@ -10,6 +10,9 @@ publish = false
 rust-version = "1.88"
 description = "Collision avoidance for coding agents that share a checkout"
 homepage = "https://tcas.io"
+repository = "https://github.com/Jaciezyt/tcas"
+keywords = ["ai-agents", "claude-code", "git", "file-locking", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 tcas-core = { path = "crates/tcas-core" }
