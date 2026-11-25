@@ -26,7 +26,7 @@ plugins/claude/
 | 方式 | 命令 | 状态 |
 |---|---|---|
 | 开发时 | `claude --plugin-dir <仓库>/plugins/claude` | 实测可用，无界面模式下 hook 照常触发 |
-| 正式 | `tcas plugin install claude`：把 plugin 写到 `~/.tcas/plugins/claude/`，再调用 `claude plugin marketplace add` 和 `claude plugin install` | 没测，见第 9 节 |
+| 正式 | `tcas plugin install claude`：把 plugin 写到 `~/.tcas/plugins/claude/`，再调用 `claude plugin marketplace add` 和 `claude plugin install` | 实测可用（第 9 节） |
 
 要求 Claude Code 2.1.295 以上（文档称 hook 的 `onFailure` 字段从这个版本开始有；本机 2.1.327 上实测有效）。用 `--bare` 启动的会话不运行 hook，不受约束。
 
@@ -54,7 +54,7 @@ plugins/claude/
 
 **续接**：`--resume` 之后 `session_id` 不变，进程是新的，`SessionStart` 再触发一次，`source` 为 `resume`（实测）。tcasd 更新 PID，遗留租约接回。
 
-**同一个进程里换了会话 ID**（`/clear`）：`SessionStart` 到达时，如果同一个进程（PID 和启动时间都相同）名下有另一个会话，不论它是否已经被 `SessionEnd` 标为结束，新会话接过它的全部租约（包括遗留租约），旧会话标为结束。`/clear` 是否真的换 ID 没测；这条规则在不换 ID 时不起作用。
+**同一个进程里换了会话 ID**（`/clear`）：`SessionStart` 到达时，如果同一个进程（PID 和启动时间都相同）名下有另一个会话，不论它是否已经被 `SessionEnd` 标为结束，新会话接过它的全部租约（包括遗留租约），旧会话标为结束。实测 `/clear` 会换 ID（第 9 节）。
 
 ## 3. Hook 一览
 
@@ -249,7 +249,7 @@ Bash 写文件拦不住。第一版用三层来管：
 Bash 调用的整条命令是一个 `tcas` 命令时（只有一个简单命令，程序名是 `tcas`，没有 `;`、`&&`、管道、重定向和命令替换），`PreToolUse` 的处理不同：
 
 - **不开对账窗口**。`tcas lease wait` 会运行很久，窗口一直开着的话，这期间别的会话用 Bash 做的改动都会变成归属不确定。
-- **直接批准**（`permissionDecision: "allow"`），限于 agent 可用的这些子命令：`lease acquire`、`lease release`、`lease list`、`lease who`、`lease wait`、`status`、`workspace list`、`session list`、`exempt list`、`log`、`stats`、`doctor`。实测：默认权限模式下，不批准时这条命令被 harness 以「需要批准」拒绝，批准后直接运行。
+- **直接批准**（`permissionDecision: "allow"`），限于 agent 可用的这些子命令：`lease acquire`、`lease release`（不带只有用户能用的 `--force`）、`lease list`、`lease who`、`lease wait`、`status`、`workspace list`、`session list`、`exempt list`、`log`、`stats`、`doctor`、`whoami`。实测：默认权限模式下，不批准时这条命令被 harness 以「需要批准」拒绝，批准后直接运行。
 - **`tcas lease wait` 只在后台运行**。这次调用没有设 `run_in_background` 时，hook 在批准的同时用 `updatedInput` 把它改成后台运行。实测：改写后工具调用 0.2 秒就返回，命令 3 秒后才结束，这一轮没有被它占住，命令结束时会话被唤醒。
 - `tcas lease wait` 出现在一条复合命令里（如 `tcas lease wait x && …`），又不是后台运行时，hook 改写不了，就拒绝这次调用，让 agent 把它单独作为一条后台命令运行。
 - `tcas commit` 不自动批准。它会运行 git 的提交钩子，权限照常由 harness 决定。
@@ -585,27 +585,30 @@ Claude Code 2.1.327，macOS，无界面模式（`claude -p`），plugin 用 `--p
 
 ## 9. 还没测的
 
+下面这些原来列在这里，之后已经实测（2026-11-20 到 11-25，结果在 [tests/probe/RESULTS.md](../../tests/probe/RESULTS.md)），结论都和预期一致：
+
+- 通过 marketplace 安装（`tcas plugin install claude`）后 hook 照常触发，不需要 `--plugin-dir`。
+- 交互模式下 hook 照常触发；`updatedInput` 能把前台调用改成后台；后台命令结束时空闲的会话不用按键就被唤醒，注入的内容到达模型。
+- `onFailure: "block"` 在超时、退出码 1 和 2、输出不合法、程序不存在时都拦截。
+- `bypassPermissions` 下（无界面和交互）`PreToolUse` 仍然触发，拒绝仍然有效。
+- `/clear` 换会话 ID，先 `SessionEnd`（`reason: clear`）再 `SessionStart`（`source: clear`），harness 进程不变；第 2 节的接替规则是需要的。
+- 编辑失败（要替换的文本不存在）时任何工具 hook 都不触发，只有 `Stop`。
+- `NotebookEdit` 的路径字段是 `notebook_path`。
+- hook 批准的命令仍受用户配置的拒绝规则约束（拒绝规则优先）。
+- `tcas git-hook` 的开销：`reference-transaction` 的快速路径约 3 毫秒，`pre-commit` 约 11 毫秒（debug 构建）。
+
+仍然没测的：
+
 | 项目 | 如果结果不如预期 |
 |---|---|
-| 通过 marketplace 安装后 plugin 的行为是否和 `--plugin-dir` 一致 | 改成让用户把 hook 写进 `settings.json`，`tcas plugin install` 代为写入 |
-| 交互模式下的行为（上面全部是无界面模式） | 逐条重测第 8 节 |
-| `onFailure: "block"` 在超时、非零退出码、输出不合法时是否拦截（文档说是，只测了程序不存在） | `tcas hook` 自己保证任何出错路径都输出 `deny` |
-| `bypassPermissions` 模式下 `PreToolUse` 是否还触发 | 文档里注明这种模式不受约束，或在 `SessionStart` 时警告 |
-| `/clear` 是否换会话 ID | 见第 2 节，规则两种情况都能处理 |
-| 编辑失败（要替换的文本不存在）触发哪个事件 | 两个事件都挂了 hook，另有 `Stop` 兜底 |
-| `NotebookEdit` 的路径字段名（文档里是 `notebook_path`） | 改适配层 |
 | harness 被强杀时不触发 `SessionEnd` | 靠 tcasd 的进程检查，已在设计里 |
 | Codex 下，Bash 命令的祖先进程里是否同样有 harness 进程 | 没有的话只靠环境变量认会话 |
 | brief 相关的行为在别的模型、多次运行下是否稳定（每种情况只用 haiku 跑了一次） | 统计里看被拒之后去等、换做法、告诉用户各占多少；调整拒绝理由的措辞 |
 | 后台等待结束后，命令的输出会话读不到（实测两次，会话都说读不到输出文件） | 已经靠 hook 注入结果；实现后确认注入的内容在这种情况下到达 |
 | 别的 git 版本是否支持配置式钩子（只在 2.54.0 上测过） | 安装时实际试一次；不支持就不装，或改为往 `.git/hooks/` 里放转发脚本 |
-| git 钩子里 `tcas git-hook` 的实际开销（实测用的是空命令） | `reference-transaction` 太慢就默认关掉，stash 只靠命令护栏 |
 | 图形界面的 git 客户端和 IDE 提交时，被 `pre-commit` 拒绝后给用户看到什么 | 输出看不到的话，在文档里说明到终端里看，或改成只警告 |
 | 先申请的建议在别的模型、更长的任务上是否同样有效（只用 haiku 各测了一次） | 靠改到第三个文件时的提醒补；统计里看先申请的比例；要强制就用 `strict` |
-| 交互模式下，后台命令结束是否同样唤醒空闲的会话 | 不唤醒的话，等待的结果要到用户下一次输入才送到；等到的租约 10 分钟后可以让出，不会一直占着 |
-| 交互模式下 hook 能否把调用改成后台运行 | 改不了就拒绝前台的等待，让 agent 自己用后台方式重新运行 |
 | 后台命令有没有运行时限；关闭交互会话时后台命令是否被终止 | 有时限就把默认超时调到它以下；不终止的话靠 tcasd 在会话结束时取消等待 |
-| hook 批准的命令是否仍受用户配置的拒绝规则约束 | 在文档里说明；必要时去掉自动批准，改为建议用户在权限设置里放行 `tcas` |
 | 大仓库上 `git status` 的耗时 | 开启 git 的 fsmonitor 和 untracked cache；或按 workspace 关掉 Bash 对账 |
 | Linux | 路径规范化、进程启动时间的取法要另写 |
 

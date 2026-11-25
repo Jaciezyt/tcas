@@ -59,6 +59,8 @@ SQLite，WAL 模式。表：
 | `event` | `seq`、`at`、`workspace`、`session`、`agent`、`type`、`payload` | 只追加 |
 | `meta` | `key`、`value` | 数据库版本 |
 
+实现里另有几张辅助表，都是派生出来的状态，丢了不影响租约判定：`session_ws`（会话已经收到过哪些 workspace 的用法说明）、`read_hint`（读取提示已经给过哪些）、`wait_notified`（「有人在等」已经通知过哪些）、`outside_edit`（改到 workspace 外面的记录，`tcas status` 用）、`commit_seen`（已经处理过的提交，钩子和 `tcas commit` 各报一次时只算一次）、`session_alias`（AGY 子 agent 的会话 ID 指向父会话，[harness.md](harness.md) 第 10 节）。`lease` 表另有 `repo`（所属的检出）、`edited_at`、`stalled_at`，`session` 表另有 `turn` 等统计用的列。
+
 相交判定不在 SQL 里做：一个 workspace 的租约数量是几十到几百条，读出来在内存里比。
 
 **事件**是审计记录，也是以后做统计的原料。每次租约表变化和对应的事件在同一个事务里。
@@ -85,6 +87,9 @@ SQLite，WAL 模式。表：
 | `commit` | 任何提交，由 `post-commit` 钩子报告（没装钩子时由 `tcas commit` 或对账报告），带提交号、路径、发起者 |
 | `branch.changed` | 带仓库 |
 | `hook.error` | `tcas hook` 报告的异常 |
+| `lease.unstalled` | 停滞的标记消失：持有者又有活动、提交、转交或释放 |
+| `wait.resumed` | tcasd 重启后 `tcas lease wait` 重新登记 |
+| `workspace.mode`、`exempt.added`、`exempt.removed`、`git_hooks.installed`、`git_hooks.removed` | 用户改了设置 |
 
 ## 4. 协议
 
@@ -102,7 +107,7 @@ Unix 套接字上，一个连接发一行 JSON 请求，收一行 JSON 应答，
 - `v` 不匹配时 tcasd 返回 `version_mismatch`，`tcas` 提示升级。
 - 套接字权限 `0600`，只有同一个系统用户能连。不做别的鉴权（[plan.md](plan.md) 第 6 节）。
 
-**命令行用的操作**和第 5 节的命令一一对应：`workspace.open`、`workspace.add`、`workspace.remove`、`workspace.close`、`workspace.list`、`status`、`lease.acquire`、`lease.wait`、`lease.release`、`lease.list`、`lease.who`、`lease.grant`、`lease.transfer`、`session.list`、`session.end`、`exempt.list`、`exempt.add`、`exempt.remove`、`commit.prepare`、`commit.done`、`log`、`stats`、`doctor`、`daemon.status`、`daemon.stop`。
+**命令行用的操作**和第 5 节的命令一一对应：`workspace.open`、`workspace.add`、`workspace.remove`、`workspace.close`、`workspace.list`、`status`、`lease.acquire`、`lease.wait`、`lease.release`、`lease.list`、`lease.who`、`lease.grant`、`lease.transfer`、`session.list`、`session.end`、`exempt.list`、`exempt.add`、`exempt.remove`、`commit.prepare`、`commit.done`、`git_hooks.install`、`git_hooks.remove`、`git_hooks.status`、`log`、`stats`、`doctor`、`whoami`、`daemon.status`、`daemon.stop`。
 
 **git 钩子用的操作**是 `git.hook`：钩子名、仓库、发起者（会话或用户）、涉及的路径或引用；应答是放行或拒绝加理由。
 
@@ -169,7 +174,7 @@ interface HookResponse {
 
 | 命令 | 用户 | agent |
 |---|---|---|
-| 查看：`status`、`workspace list`、`session list`、`lease list`、`lease who`、`exempt list`、`log`、`stats`、`doctor` | 能 | 能 |
+| 查看：`status`、`workspace list`、`session list`、`lease list`、`lease who`、`exempt list`、`log`、`stats`、`doctor`、`whoami` | 能 | 能 |
 | `lease acquire`、`lease wait`、`lease release`、`commit` | 不适用，用户不受租约约束 | 能 |
 | `workspace open`、`workspace add` | 能 | 能，有限制，见下 |
 | `workspace close`、`workspace remove` | 能 | 只能撤销自己打开或加进来的，而且里面已经没有任何租约、没有别的活着的会话 |
@@ -468,7 +473,8 @@ released: 3 file leases.  still held: api/src/auth/ (directory)
 | `tcas git-hooks install\|remove\|status [仓库]` | 单独给一个仓库装上、去掉 git 钩子，或查看状态 |
 | `tcas plugin install <claude\|agy\|codex>` | 生成并安装 plugin |
 | `tcas plugin path <harness>` | 输出 plugin 目录，开发时配合 `--plugin-dir` 用 |
-| `tcas daemon start\|stop\|status` | |
+| `tcas daemon start\|stop\|status` | `stop` 只有用户能用，tcasd 没在运行时也一样 |
+| `tcas whoami` | tcasd 把这条命令认作谁：哪个会话，或用户（第 2 节的认法，含祖先进程）。排查身份问题用 |
 | `tcas doctor` | 检查：豁免的目录有哪些、有没有和 workspace 的根冲突；tcasd 是否在运行、版本是否一致、plugin 是否安装、当前目录是否在 workspace 里、git 是否支持配置式钩子、各仓库的 git 钩子是否装着 |
 
 ### 统计

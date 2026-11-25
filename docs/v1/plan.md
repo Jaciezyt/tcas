@@ -57,6 +57,8 @@ tests/
 
 `tcas-core` 不做 I/O，所以租约规则、路径、护栏、对账都能用普通的单元测试覆盖。git 状态以数据的形式传进去。
 
+实际的代码结构和上面有几处不同（2026-11-25）：多了 `crates/tcas-sys`（时钟、进程、文件系统、`~/.tcas`，把 I/O 从 `tcas-core` 隔出去）；`path.rs` 拆成了 `abspath.rs`、`relpath.rs`、`pathfmt.rs`、`exempt.rs`、`unmanaged.rs`；快照的比较和归属、git 钩子的判定在 `tcasd` 里（`reconcile.rs`、`handlers/git.rs`），没有放进 `tcas-core`；`tcasd` 是一个库，两个程序的入口都在 `crates/tcas` 里；端到端测试在 `crates/tcas/tests/`，不变量的性质测试在 `crates/tcas-core/tests/invariants.rs`。
+
 ## 3. 里程碑
 
 每个里程碑结束时都有一个能用的东西。
