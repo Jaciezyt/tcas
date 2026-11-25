@@ -1,6 +1,6 @@
 # TCAS
 
-**让共用一份检出的 coding agent 互不相撞。**
+**让共用同一个 checkout 的 coding agent 互不相撞。**
 
 [English](README.md)
 
@@ -22,10 +22,10 @@ To wait for it, run this as a background command (Bash tool, run_in_background):
 - **按文件和目录发租约**。会话第一次改某个文件时自动取得它的租约，agent 不需要学任何新东西。做较大的改动前，可以事先按目录申请，全有或全无，并用一句 `--brief` 告诉别的会话自己在做什么。
 - **写之前就拒绝，而不是事后发现**。编辑工具在 harness 的 `PreToolUse` hook 里检查。tcasd 连不上时，workspace 里的修改一律拒绝，而不是放行。
 - **等待不占主线程**。`tcas lease wait` 作为后台命令运行，拿到租约时会话被唤醒。等待之间的死锁会被发现并解开。
-- **Shell 命令也管**。别的会话在同一个检出里持有租约时，命令护栏拒绝 `git add -A`、`git commit -a`、`git stash`、`git reset --hard`、切分支等命令（能看穿 `cd`、`bash -c`、`env`、git 别名等写法）。git 钩子不论命令从哪里发起都会检查同样的操作；每次 Bash 调用结束后还会对账，看它改了哪些文件。
-- **只提交自己的文件**。`tcas commit` 只提交本会话改过的文件，每个检出提交一次，别的会话已经暂存的文件不受影响。提交即释放租约。
+- **Shell 命令也管**。别的会话在同一个 checkout 里持有租约时，命令护栏拒绝 `git add -A`、`git commit -a`、`git stash`、`git reset --hard`、切分支等命令（能看穿 `cd`、`bash -c`、`env`、git 别名等写法）。git 钩子不论命令从哪里发起都会检查同样的操作；每次 Bash 调用结束后还会对账，看它改了哪些文件。
+- **只提交自己的文件**。`tcas commit` 只提交本会话改过的文件，每个 checkout 提交一次，别的会话已经暂存的文件不受影响。提交即释放租约。
 - **租约会自己让出**。干净文件上的租约会让给下一个来申请的会话；显式申请的租约 30 分钟没用到，或者持有者提交过、结束了这一轮，也会让出。有未提交改动的文件不会自动换手。
-- **贴合现有的用法**。一个或几个检出、装着多个仓库的目录、worktree、子模块、并排的多个目录都可以放进一个 workspace。被 git 排除的文件、临时目录和 harness 自己的目录不管。
+- **贴合现有的用法**。一个或几个 checkout、装着多个仓库的目录、worktree、子模块、并排的多个目录都可以放进一个 workspace。被 git 排除的文件、临时目录和 harness 自己的目录不管。
 - **可度量**。租约的每次变化都有事件记录；`tcas stats` 给出争用、等待、越界，以及 agent 事先申请的比例。
 
 ## 安装
@@ -87,7 +87,7 @@ src/auth/session.ts  src/auth/ leased by claude:7958a1b2 since 14:02 (cli, dir, 
 
 | 命令 | 谁能用 | 作用 |
 |---|---|---|
-| `tcas workspace open [目录…]` | 用户、agent | 开始保护一个检出，或装着几个检出的目录 |
+| `tcas workspace open [目录…]` | 用户、agent | 开始保护一个 checkout，或装着几个 checkout 的目录 |
 | `tcas workspace add <目录>` / `remove <目录>` | 用户、agent | 加进或去掉一个并排的目录、一个外面的 worktree |
 | `tcas workspace close` | 用户、agent | 停止保护（agent 只能关自己打开的、已经空了的） |
 | `tcas workspace list` | 任何人 | 列出 workspace 和是谁打开的 |
@@ -124,7 +124,7 @@ src/auth/session.ts  src/auth/ leased by claude:7958a1b2 since 14:02 (cli, dir, 
         │        事件日志                             │
         └─────┬──────────────────────────────────────┘
               │ git status、check-ignore（只读）
-        你的检出（你和所有会话共用）
+        你的 checkout（你和所有会话共用）
 ```
 
 - **`tcas`** 是给你和 agent 用的命令行，也是 harness 的 hook 和 git 钩子调用的程序。
@@ -163,7 +163,7 @@ TCAS 防的是 agent 无意中互相干扰，它不是沙箱。
 - 被 git 排除的文件（`.env.local`、构建产物）没有保护。
 - 你自己的修改不受限制，只有提交会被检查。
 - 同时去掉环境变量和进程祖先链的会话会被当成用户。
-- 不在任何 workspace 里的目录不管；会话改到那里的检出时会收到一次提示。
+- 不在任何 workspace 里的目录不管；会话改到那里的 checkout 时会收到一次提示。
 
 完整的列表见 [`docs/v1/leases.md`](docs/v1/leases.md) 第 9 节。
 
