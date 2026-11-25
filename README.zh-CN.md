@@ -25,7 +25,7 @@ To wait for it, run this as a background command (Bash tool, run_in_background):
 - **Shell 命令也管**。别的会话在同一个 checkout 里持有租约时，命令护栏拒绝 `git add -A`、`git commit -a`、`git stash`、`git reset --hard`、切分支等命令（能看穿 `cd`、`bash -c`、`env`、git 别名等写法）。git 钩子不论命令从哪里发起都会检查同样的操作；每次 Bash 调用结束后还会对账，看它改了哪些文件。
 - **只提交自己的文件**。`tcas commit` 只提交本会话改过的文件，每个 checkout 提交一次，别的会话已经暂存的文件不受影响。提交即释放租约。
 - **租约会自己让出**。干净文件上的租约会让给下一个来申请的会话；显式申请的租约 30 分钟没用到，或者持有者提交过、结束了这一轮，也会让出。有未提交改动的文件不会自动换手。
-- **贴合现有的用法**。一个或几个 checkout、装着多个仓库的目录、worktree、子模块、并排的多个目录都可以放进一个 workspace。被 git 排除的文件、临时目录和 harness 自己的目录不管。
+- **贴合现有的用法**。一个或几个 checkout、装着多个仓库的目录、worktree、子模块、并排的多个目录都可以放进一个 workspace；当前目录已在打开的 workspace 里时，harness 附带的额外目录（`--add-dir`、`/add-dir` 或多根工作区路径）也会自动并入。被 git 排除的文件、临时目录和 harness 自己的目录不管。
 - **可度量**。租约的每次变化都有事件记录；`tcas stats` 给出争用、等待、越界，以及 agent 事先申请的比例。
 
 ## 安装

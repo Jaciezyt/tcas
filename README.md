@@ -1,100 +1,205 @@
 # TCAS
 
-面向多 Agent 并行开发的本机文件与目录租约协调层：让你照常启动多个 coding agent 会话（Claude Code、Google Antigravity `agy` 等），在**同一个检出或多仓库项目**里同时改代码而不相撞。
+**Collision avoidance for coding agents that share a checkout.**
 
-主页：[tcas.io](https://tcas.io)
+[中文](README.zh-CN.md)
 
-## 解决什么问题
+Run several Claude Code or Antigravity CLI sessions in the same repository and sooner or later two of them edit the same file, or one runs `git add -A`, `git stash` or `git checkout .` over the other's half-finished work. TCAS stops that. It gives every file **one writer at a time**: a session that tries to change a file another session is working on is refused on the spot, told who holds it and why, and can wait for it in the background while it gets on with something else.
 
-在同一份工作目录里同时开两三个会话改代码时，常见撞车场景包括：两个会话同时改同一个文件、一个会话跑 `git add -A` / `git commit -a` 把别人改到一半的代码一起提交、或者 `git stash` / `git rebase` 破坏别人的工作区。
-
-TCAS 通过原生 Harness 插件的 Hook 与仓库级 Git 钩子在后台协调所有会话：
-
-- **默认无感互斥（`auto` 模式）**：会话改文件时自动取得租约；已被其他会话占用时当场拒绝，告知对方持有的范围与 `brief`，并给出后台等待命令（`tcas lease wait`），释放后自动唤醒。支持按需切换为强制事先申请的 `strict` 模式。
-- **目录租约与意图广播**：做较大改动前用 `tcas lease acquire src/auth/ --brief "…"` 一次锁住目录并广播一句话说明，冲突在动手前暴露；内置等待环（死锁）检测与空闲/已提交租约自动让出。
-- **Shell 与 Git 保护**：命令护栏拦截多会话共存时的 `git add -A`、`git stash`、`git rebase` 等全局破坏性命令；仓库配置式 Git 钩子兜底校验并在提交后自动释放租约；Bash 执行前后做快照对账归属写入。
-- **按会话隔离提交**：`tcas commit -m "…"` 只暂存并提交当前会话自己改过的文件（跨多个仓库时逐仓提交），不动其他会话或用户的改动。
-- **多仓库与 `/add-dir` 自动并入**：一个 workspace 可管理嵌套或并排的多个仓库（`tcas workspace add`）；当前目录已在开启的 workspace 中时，通过 `--add-dir` / `/add-dir` 或 IDE 多根工作区附带的目录会自动并入同一 workspace 持久受保。
-
-## 支持的 Harness
-
-| Harness | 状态 | 插件安装命令 |
-|---|---|---|
-| Claude Code (`claude`) | 已支持 | `tcas plugin install claude` |
-| Google Antigravity CLI / IDE (`agy`) | 已支持 | `tcas plugin install agy` |
-| OpenAI Codex CLI (`codex`) | 规划中（Milestone 7） | — |
-
-不同 Harness 的会话可以在同一个 workspace 里混用并互相协调。
-
-## 安装与快速开始
-
-### 1. 编译安装二进制
-
-需要 Rust 工具链（Edition 2024）与 Git（支持配置式钩子，Git 2.36+）：
-
-```sh
-cargo install --path crates/tcas
+```
+tcas: src/auth/session.ts is leased by another session (claude:7958…, since 14:02).
+  Their brief: "Fix the login redirect loop in src/auth"
+It has uncommitted work in progress. Do not modify it by any other means, including Bash.
+If their brief already covers the change you were about to make, do not wait: tell the user.
+To wait for it, run this as a background command (Bash tool, run_in_background):
+  tcas lease wait src/auth/session.ts --brief "<one line: what you need it for>"
 ```
 
-这会将 `tcas`（CLI 与 Hook 入口）和 `tcasd`（本机后台守护进程）安装到 `~/.cargo/bin/`。请确保安装目录在你的 `PATH` 中（也可手动复制 `target/release/{tcas,tcasd}` 到 `~/.local/bin/` 或 `~/.tcas/bin/`）。
+*What an agent sees when it tries to edit a file another session is changing.*
 
-### 2. 安装 Harness 插件并自检
+## Features
+
+- **Leases on files and directories.** A session takes a file's lease the first time it edits it; nothing to learn for the agent. Before a larger change it can claim a whole directory up front, all or nothing, with a one-line `--brief` that other sessions see.
+- **Refused before the write, not after.** Edit tools are checked in the harness's `PreToolUse` hook. If tcasd is unreachable, edits inside a workspace are refused rather than let through.
+- **Waiting without blocking.** `tcas lease wait` runs as a background command; the session is woken when the lease is granted. Deadlocks between waiting sessions are detected and broken.
+- **Shell commands are covered too.** A command guard refuses `git add -A`, `git commit -a`, `git stash`, `git reset --hard`, branch switches and the like while others hold leases in that checkout (it reads through `cd`, `bash -c`, `env`, aliases and more). Git hooks catch the same operations however they were started, and each Bash call is reconciled afterwards to see which files it changed.
+- **Commits that take only your files.** `tcas commit` commits the files this session changed, one commit per checkout, leaving other sessions' staged files alone. Committing releases the leases.
+- **Leases let go on their own.** A lease on a clean file gives way to the next session that asks; explicit leases yield after 30 minutes unused, or once their holder has committed and ended its turn. A file with uncommitted changes never changes hands by itself.
+- **Works with how you already work.** One checkout or several, repositories nested inside a folder, worktrees, submodules, sibling directories in one workspace—plus extra directories attached by the harness (`--add-dir`, `/add-dir`, or multi-root workspace paths) are automatically added to an open workspace. Git-ignored files, temporary directories and the harnesses' own directories are left alone.
+- **Measurable.** Every lease change is an event; `tcas stats` reports contention, waits, overreach and how often agents claimed files before editing them.
+
+## Install
+
+TCAS is built from source and needs Rust 1.88 or later.
 
 ```sh
-# 按需安装你使用的 Harness 插件（在普通终端中运行）
+git clone https://github.com/Jaciezyt/tcas.git
+cd tcas
+cargo install --path crates/tcas     # installs tcas and tcasd into ~/.cargo/bin
+```
+
+Then add the plugin to the harnesses you use. This needs the harness's own command (`claude` or `agy`) on your `PATH`.
+
+```sh
 tcas plugin install claude
 tcas plugin install agy
-
-# 检查守护进程、Git 版本与插件状态
-tcas doctor
+tcas doctor                          # checks the daemon, plugins, git hooks and configuration
 ```
 
-> **AGY 沙箱提示**：AGY 的 Hook 运行在沙箱外，自动租约与冲突拦截开箱即用；若希望 AGY 会话在 `run_command` 沙箱内也能直接调用 `tcas lease acquire` / `tcas commit`，可在 AGY 沙箱设置中放行 `~/.tcas`（或允许 `tcas` 命令脱离沙箱执行）。
+Restart running sessions so they load the plugin. The plugin holds only hook configuration, a small script that forwards to your installed `tcas`, and usage notes for the agent; upgrading `tcas` does not require reinstalling it.
 
-### 3. 在项目中启用
+## Quick start
 
-进入项目根目录打开 workspace（`tcasd` 会在首次调用时自动在后台拉起）：
+Tell TCAS which directory to protect. Run this in a repository, or in a folder that holds several:
+
+```console
+$ cd ~/Code/app
+$ tcas workspace open
+opened /Users/me/Code/app (mode auto), 1 checkout:
+  .           repo       main
+```
+
+That is all the setup there is. Start your sessions as usual; they take and release leases as they edit and commit. The daemon `tcasd` starts on first use.
+
+To see what is going on:
+
+```console
+$ tcas status
+workspace  /Users/me/Code/app   mode auto   branch main
+
+SESSION         STATE   LAST   TITLE                     LEASES
+claude:1cce03d4 active  now    add export button         1
+claude:7958a1b2 active  now    fix login redirect        1
+
+claude:7958a1b2
+  src/auth/                   cli    14:02   dir, 1 file, used 0s ago
+  brief: "Fix the login redirect loop in src/auth"
+…
+
+$ tcas lease who src/auth/session.ts
+src/auth/session.ts  src/auth/ leased by claude:7958a1b2 since 14:02 (cli, dir, 1 file, used 0s ago)
+                       their brief: "Fix the login redirect loop in src/auth"
+```
+
+Your own edits are not restricted. Your commits are checked, though: if a commit would include a file a session is still changing, the git hook refuses it and names the file. Commit only your own paths, or override once with `TCAS_ALLOW=1 git commit …`.
+
+## Commands
+
+| Command | Who | What it does |
+|---|---|---|
+| `tcas workspace open [dir…]` | user, agent | Start protecting a checkout or a folder of checkouts |
+| `tcas workspace add <dir>` / `remove <dir>` | user, agent | Add or remove a sibling directory or an outside worktree |
+| `tcas workspace close` | user, agent | Stop protecting a workspace (an agent only one it opened, once empty) |
+| `tcas workspace list` | anyone | List workspaces and who opened them |
+| `tcas workspace set mode auto\|strict` | user | `strict`: sessions must claim files before editing them |
+| `tcas status` | anyone | Sessions, their leases, stalled and orphaned leases, unattributed changes |
+| `tcas lease acquire <path…> --brief "…"` | agent | Claim files or directories up front, all or nothing |
+| `tcas lease wait <path…> --brief "…"` | agent | Wait until all of them can be granted (run in the background) |
+| `tcas lease release [<path…>\|--all]` | agent | Give leases back |
+| `tcas lease list` / `who <path…>` | anyone | Who holds what, and why a path is not managed |
+| `tcas lease grant` / `transfer` / `release --force` | user | Hand out, move or revoke a session's leases |
+| `tcas commit -m "…" [<path…>]` | agent | Commit only this session's changed files |
+| `tcas session list` | anyone | Sessions and what they hold |
+| `tcas session end <session>` | user | End a session by hand |
+| `tcas log` / `tcas stats` | anyone | The event log; contention and usage statistics |
+| `tcas exempt list` | anyone | Directories TCAS never manages, and why |
+| `tcas exempt add` / `remove <dir>` | user | Change that list |
+| `tcas plugin install <harness>` / `tcas doctor` | user | Install plugins; check the installation |
+| `tcas daemon start\|stop\|status` | user | Control `tcasd` (it starts by itself when needed) |
+
+Every command takes `--json`. Exit codes: `0` success, `1` error, `3` lease denied, `4` wait timed out, `5` deadlock, `6` user-only command.
+
+TCAS tells an agent what it may do. Commands that only add protection or only read are open to agents (and hooks approve the safe ones automatically); commands that could be used to get around another session's lease are the user's alone. A session is recognized by its environment and by its ancestor processes, so clearing environment variables does not make an agent the user.
+
+## How it works
+
+```
+ your terminal           harness session A          harness session B
+   │ tcas …                │ plugin hooks              │ plugin hooks
+   │                       │ tcas hook / tcas lease …  │
+   └──────────┬────────────┴─────────────┬─────────────┘
+              │  Unix socket ~/.tcas/tcasd.sock
+        ┌─────▼──────────────────────────────────────┐
+        │ tcasd: workspaces · sessions · leases ·    │  ~/.tcas/tcas.db (SQLite)
+        │        waits · event log                   │
+        └─────┬──────────────────────────────────────┘
+              │ git status, check-ignore (read-only)
+        your checkouts (shared by you and every session)
+```
+
+- **`tcas`** is the command line for you and the agents, and the program the harness hooks and git hooks call.
+- **`tcasd`** is a per-user daemon. It keeps the lease table in SQLite and makes every decision in one transaction. It never writes to your working tree; the only thing it changes in a repository is one `include.path` line in `.git/config` for the git hooks.
+- **Edits** are checked before they happen (`PreToolUse`). **Shell commands** cannot be stopped from writing files, so they get three layers: the command guard before the command runs, git hooks for commits, rebases and stashes, and a git-status snapshot before and after each call to see what changed. A write to a file someone else holds is reported to both sessions, never reverted.
+
+The full design, the rules and the reasoning behind them are in [`docs/v1/`](docs/v1/README.md) (Chinese).
+
+## Configuration
+
+Defaults work without any configuration. Global settings live in `~/.tcas/config.toml`; per-workspace settings in a `.tcas.toml` at the workspace root, which you can commit:
+
+```toml
+mode = "auto"                         # auto | strict (claim before editing)
+roots = ["../app-backend"]            # sibling directories that belong to this workspace
+exempt = ["scratch/"]                 # directories TCAS leaves alone
+unmanaged = ["pnpm-lock.yaml"]        # tracked files that need no lease (generated files)
+
+[lease]
+explicit_idle_secs = 1800             # an unused explicit lease may yield after this
+max_dir_files = 200                   # largest directory a session may claim at once
+
+[git_hooks]
+check_user = true                     # also check your own commits
+```
+
+Every option is described in [`docs/v1/daemon-and-cli.md`](docs/v1/daemon-and-cli.md#6-配置). Agents cannot change these files: edits to `~/.tcas` and `.tcas.toml` are refused.
+
+To run a single session without TCAS, start it with `TCAS_DISABLE=1`.
+
+## Limits
+
+TCAS guards against agents getting in each other's way by accident; it is not a sandbox.
+
+- Shell commands can still write files someone else holds. Such writes are found afterwards and reported, not prevented.
+- Git-ignored files (`.env.local`, build output) are not protected.
+- Your own edits are not restricted, only your commits are checked.
+- A session that deliberately strips both its environment and its process ancestry is treated as the user.
+- Directories outside every workspace are not managed; sessions are told once when they edit a checkout there.
+
+See [`docs/v1/leases.md`](docs/v1/leases.md), section 9, for the complete list.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/v1/README.md](docs/v1/README.md) | Overview, scope and the design choices behind them |
+| [docs/v1/leases.md](docs/v1/leases.md) | The lease model: paths, acquiring, releasing, waiting, invariants |
+| [docs/v1/harness.md](docs/v1/harness.md) | Plugins, every hook, failure handling, measured harness behavior |
+| [docs/v1/daemon-and-cli.md](docs/v1/daemon-and-cli.md) | The daemon, storage, protocol, every command, configuration |
+| [docs/v1/walkthrough.md](docs/v1/walkthrough.md) | Three sessions and the user working in parallel, step by step |
+| [docs/v1/plan.md](docs/v1/plan.md) | Milestones, acceptance cases, risks |
+| [tests/probe/RESULTS.md](tests/probe/RESULTS.md) | Measured Claude Code and AGY hook behavior |
+
+The documentation is in Chinese.
+
+## Development
 
 ```sh
-cd ~/Code/your-project
-tcas workspace open
-
-# 如果项目还有并排的关联仓库，可一并加入（或使用 harness 的 --add-dir / /add-dir 自动并入）
-tcas workspace add ../your-backend ../your-ui-kit
+cargo build
+cargo test --workspace      # unit, property and end-to-end tests
+cargo clippy --workspace --all-targets
 ```
 
-之后在该目录启动多个 Claude Code 或 AGY 会话即可并行工作。
+The end-to-end tests start real `tcasd` processes over Unix sockets in temporary git repositories; they fail inside sandboxes that block local sockets. Harness probes, which run real Claude Code and AGY sessions, are in `tests/probe/` (`tests/probe/run.sh`).
 
-## 常用命令
-
-| 命令 | 用途 |
+| Directory | Contents |
 |---|---|
-| `tcas workspace open [目录…]` | 开启 workspace（自动发现仓库并挂载配置式 Git 钩子） |
-| `tcas workspace add <目录…>` | 将并排仓库或外部 worktree 加入当前 workspace |
-| `tcas workspace set mode <auto\|strict>` | 切换默认自动租约（`auto`）或强制先申请（`strict`） |
-| `tcas workspace close` | 关闭当前 workspace 并移除挂载的 Git 钩子 |
-| `tcas status` | 查看当前 workspace 的活跃会话、持有租约、停滞/遗留改动 |
-| `tcas lease acquire <路径…> [--brief "…"]` | 事先按目录或文件申请租约（全有或全无） |
-| `tcas lease wait <路径…> [--brief "…"]` | 后台等待路径释放并自动接手租约 |
-| `tcas lease release [<路径…>] [--all]` | 释放持有的租约（`--force` 供用户强制释放） |
-| `tcas lease who <路径…>` | 查询路径当前由哪个会话持有，或因何规则豁免/排除 |
-| `tcas commit -m "<说明>" [<路径…>]` | 只提交本会话改过的文件并释放对应文件租约 |
-| `tcas log [-n N] [--follow]` | 查看或实时追踪 workspace 事件流 |
-| `tcas stats [--since 7d]` | 统计争用热点、等待耗时、事先申请率与护栏拦截情况 |
-| `tcas doctor` | 检查 `tcasd`、Git 钩子支持、各 Harness 插件与豁免目录状态 |
+| `crates/tcas-core` | Pure logic, no I/O: paths, lease decisions, the wait graph, shell parsing and the command guard rules, protocol types |
+| `crates/tcas-sys` | Operating-system access: clock, processes, file system, the `~/.tcas` home |
+| `crates/tcasd` | The daemon: storage, request handlers, git queries, reconciliation, git hooks |
+| `crates/tcas` | The command line and both program entry points; end-to-end tests in `tests/` |
+| `plugins/` | The Claude Code and AGY plugins |
+| `tests/probe/` | Probe plugins and scripts that measure harness behavior |
 
-## 架构与文档
+## License
 
-系统仅由两个本机原生程序组成，通过 `~/.tcas/tcasd.sock`（Unix Domain Socket）通信，状态持久化在 `~/.tcas/tcasd.db`（SQLite WAL）：
-
-- **`tcas`**：用户 CLI、Agent 租约与提交工具，以及各家 Harness 共用的超轻量 Hook 适配层（`tcas hook claude`、`tcas hook agy`）与 Git 钩子入口（`tcas git-hook`）。
-- **`tcasd`**：每台机器一个的后台守护进程，负责 workspace 拓扑、会话存活检测、租约引擎、等待唤醒、Bash 快照对账与事件统计。
-
-详细规格说明见 [`docs/v1/`](docs/v1/README.md)：
-
-- [概览与设计取舍](docs/v1/README.md)
-- [租约模型与不变量](docs/v1/leases.md)
-- [Harness 插件、Hook 与实测记录](docs/v1/harness.md)
-- [Daemon、存储、CLI 与 `.tcas.toml` 配置](docs/v1/daemon-and-cli.md)
-- [实施计划与验收用例](docs/v1/plan.md)
-- [多会话并行完整演练](docs/v1/walkthrough.md)
+[MIT](LICENSE)
