@@ -42,15 +42,15 @@ pub fn join(a: &str, b: &str) -> String {
     }
 }
 
-/// `inner` with `outer` taken off the front. `outer` must contain `inner`.
+/// `inner` with `outer` taken off the front. `outer` must contain `inner`,
+/// possibly only by key: it goes by components, not bytes, since folding the
+/// case can change a path's length.
 pub fn strip(outer: &str, inner: &str) -> String {
     if outer.is_empty() {
-        inner.to_string()
-    } else if inner.len() == outer.len() {
-        String::new()
-    } else {
-        inner[outer.len() + 1..].to_string()
+        return inner.to_string();
     }
+    let n = outer.split('/').count();
+    inner.splitn(n + 1, '/').nth(n).unwrap_or("").to_string()
 }
 
 /// The parent of a relative path; the parent of a top-level name is "".
@@ -131,5 +131,17 @@ mod tests {
         assert_eq!(common_dir(["web/a.ts", "api/b.ts"]), "");
         assert_eq!(display("src", true), "src/");
         assert_eq!(display("", true), ".");
+    }
+
+    #[test]
+    fn strip_goes_by_components() {
+        assert_eq!(strip("a", "a/b/c"), "b/c");
+        assert_eq!(strip("a/b", "a/b"), "");
+        assert_eq!(strip("", "a"), "a");
+        // Folding "İ" (2 bytes) gives "i̇" (3 bytes): the keys match, the
+        // lengths do not.
+        let outer = key("İ", true);
+        assert!(contains(&outer, &key("İ/x.ts", true)));
+        assert_eq!(strip(&outer, "İ/x.ts"), "x.ts");
     }
 }

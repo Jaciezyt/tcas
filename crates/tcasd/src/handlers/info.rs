@@ -34,17 +34,21 @@ fn unattributed(env: &Env, ws: &Ws, leases: &[store::LeaseRow]) -> Vec<tcas_core
     let mut out = Vec::new();
     for repo in &ws.repos {
         let ci = ws.ci(&repo.root);
-        let inner: Vec<String> = ws
+        // Nested checkouts report their own files; a submodule's path itself
+        // (its recorded commit) is a path of this one.
+        let inner: Vec<(String, bool)> = ws
             .repos
             .iter()
             .filter(|o| o.root == repo.root && o.dir != repo.dir && relpath::contains(&repo.dir, &o.dir))
-            .map(|o| relpath::key(&o.dir, ci))
+            .map(|o| (relpath::key(&o.dir, ci), o.kind == "submodule"))
             .collect();
         for p in env.d.git.changed_paths(&ws.repo_abs(&repo.root, &repo.dir)) {
             let trimmed = p.trim_end_matches('/');
             let rel = relpath::join(&repo.dir, trimmed);
             let key = relpath::key(&rel, ci);
-            if inner.iter().any(|i| relpath::contains(i, &key) || relpath::contains(&key, i) && p.ends_with('/')) {
+            if inner.iter().any(|(i, sub)| {
+                relpath::contains(i, &key) && !(*sub && *i == key) || relpath::contains(&key, i) && p.ends_with('/')
+            }) {
                 continue;
             }
             let abs = ws.abs(&repo.root, &rel);
@@ -291,8 +295,7 @@ pub fn exempt_add(env: &mut Env, req: &Request) -> R<Value> {
         arr.push(w2.as_str());
         true
     })?;
-    env.d.global();
-    env.g = env.d.global();
+    env.g = env.d.reload_global();
     env.event(None, None, "exempt.added", json!({ "path": written }))?;
     Ok(json!({ "path": written, "changed": changed }))
 }
@@ -317,7 +320,7 @@ pub fn exempt_remove(env: &mut Env, req: &Request) -> R<Value> {
         let hint = if builtin { " It is built in; turn the built-in entries off with  [exempt] builtin = false." } else { "" };
         return Err(Fail::refused(format!("{written} is not in [exempt] paths of ~/.tcas/config.toml.{hint}")));
     }
-    env.g = env.d.global();
+    env.g = env.d.reload_global();
     env.event(None, None, "exempt.removed", json!({ "path": written }))?;
     Ok(json!({ "path": written, "changed": true }))
 }

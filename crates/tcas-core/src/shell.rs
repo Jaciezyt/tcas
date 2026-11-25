@@ -832,12 +832,92 @@ fn find_dash_c(words: &[RawWord]) -> Option<usize> {
         {
             return Some(i);
         }
-        if matches!(s, "-o" | "+o" | "-O" | "+O") {
+        if matches!(s, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file") {
             i += 1;
         }
         i += 1;
     }
     None
+}
+
+/// A literal word, as if written unquoted.
+fn lit_word(s: &str) -> RawWord {
+    RawWord {
+        word: Word::Lit(s.to_string()),
+        lit: s.to_string(),
+        raw: s.to_string(),
+        quoted: false,
+        tilde: false,
+        subs: Vec::new(),
+        assign: None,
+    }
+}
+
+/// The value of a wrapper's option among its option words `opts`: `-X v`,
+/// `-Xv`, a cluster ending in `X`, `--long v` or `--long=v`. The last one wins.
+/// `short_arg` lists the short letters that take a value.
+fn option_value(opts: &[RawWord], short_arg: &str, short: char, long: &str) -> Option<RawWord> {
+    let mut found = None;
+    let mut k = 0;
+    while k < opts.len() {
+        let Some(s) = opts[k].word.lit() else {
+            k += 1;
+            continue;
+        };
+        if let Some(l) = s.strip_prefix("--") {
+            if l == long {
+                found = opts.get(k + 1).cloned();
+                k += 1;
+            } else if let Some(v) = l.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
+                found = Some(lit_word(v));
+            }
+        } else if s.len() > 1 && s.starts_with('-') {
+            for (n, ch) in s[1..].char_indices() {
+                if ch == short {
+                    let rest = &s[1 + n + ch.len_utf8()..];
+                    if rest.is_empty() {
+                        found = opts.get(k + 1).cloned();
+                        k += 1;
+                    } else {
+                        found = Some(lit_word(rest));
+                    }
+                    break;
+                }
+                if short_arg.contains(ch) {
+                    if 1 + n + ch.len_utf8() == s.len() {
+                        k += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        k += 1;
+    }
+    found
+}
+
+/// The text inside a word written as one double-quoted string, with the
+/// backslash escapes of double quotes removed: what the word stands for
+/// before its `$…` are expanded. `None` for any other form.
+fn double_quoted_text(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut it = inner.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.next()? {
+                n @ ('"' | '\\' | '$' | '`') => out.push(n),
+                '\n' => {}
+                n => {
+                    out.push('\\');
+                    out.push(n);
+                }
+            },
+            '"' => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 impl Run<'_> {
@@ -878,6 +958,31 @@ impl Run<'_> {
         let lexed = tokenize(text, self.home);
         let mut pos = 0;
         self.list(&lexed.toks, &mut pos, ctx, Term::Top, depth + 1);
+    }
+
+    /// Runs words as the text of a script (`eval …`, `sh -c …`, `env -S …`),
+    /// with `env` exported into it. A computed word stays computed in the
+    /// script: `eval "$x"` is one command whose program is not known, and
+    /// `sh -c "cd api && git $SUB"` is `cd api` then `git` with a computed
+    /// subcommand.
+    fn run_words_as_text<'w>(
+        &mut self,
+        words: impl Iterator<Item = &'w RawWord>,
+        env: &[(String, Word)],
+        ctx: &mut Ctx,
+        depth: usize,
+    ) {
+        for (k, v) in env {
+            set_env(&mut ctx.exports, k.clone(), v.clone());
+        }
+        let text = words
+            .map(|w| match &w.word {
+                Word::Lit(s) => s.clone(),
+                Word::Dynamic(raw) => double_quoted_text(raw).unwrap_or_else(|| raw.clone()),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.run_text(&text, ctx, depth);
     }
 
     fn emit_subs(&mut self, subs: &[String], ctx: &Ctx, depth: usize) {
@@ -1043,8 +1148,10 @@ impl Run<'_> {
             self.out.push(s);
             return;
         }
-        // Strip wrappers and leading assignments.
+        // Strip wrappers and leading assignments. `env -C` and `sudo -D` run the
+        // wrapped command elsewhere: it gets its own context.
         let mut wrapped: Vec<String> = Vec::new();
+        let mut moved: Option<Ctx> = None;
         let mut i = 0;
         while let Some(w) = words.get(i) {
             if let Some(n) = w.assign {
@@ -1106,9 +1213,38 @@ impl Run<'_> {
                 _ => break,
             };
             let j = skip_options(&words, i + 1, short_arg, long_arg) + extra;
+            let opts = &words[(i + 1).min(words.len())..j.min(words.len())];
+            if let Some(chdir) = match base {
+                "env" => option_value(opts, short_arg, 'C', "chdir"),
+                "sudo" => option_value(opts, short_arg, 'D', "chdir"),
+                _ => None,
+            } {
+                let mut c = moved.take().unwrap_or_else(|| ctx.clone());
+                self.cd(&mut c, std::slice::from_ref(&chdir));
+                moved = Some(c);
+            }
+            if base == "env"
+                && let Some(script) = option_value(opts, short_arg, 'S', "split-string")
+            {
+                // `env -S "git stash"`: the string is split into the command.
+                let mut c2 = moved.take().unwrap_or_else(|| ctx.clone());
+                let mut prefix = wrapped.clone();
+                prefix.push("env".to_string());
+                let start = self.out.len();
+                let rest: Vec<RawWord> = words[j.min(words.len())..].to_vec();
+                self.run_words_as_text(std::iter::once(&script).chain(rest.iter()), &env, &mut c2, depth);
+                self.prefix_wrappers(start, &prefix, None);
+                let plain: Vec<Word> = words.iter().map(|w| w.word.clone()).collect();
+                self.outer_redirects(ctx, plain, &env, redirs, wrapped);
+                return;
+            }
             wrapped.push(base.to_string());
             i = j.min(words.len());
         }
+        let ctx: &mut Ctx = match moved.as_mut() {
+            Some(c) => c,
+            None => ctx,
+        };
         let words: Vec<RawWord> = words.split_off(i.min(words.len()));
         let plain: Vec<Word> = words.iter().map(|w| w.word.clone()).collect();
         let Some(head) = words.first().and_then(|w| w.word.lit()).map(basename) else {
@@ -1122,31 +1258,15 @@ impl Run<'_> {
         // Commands whose argument is more commands.
         if matches!(head, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash")
             && let Some(k) = find_dash_c(&words)
-            && let Some(arg) = words.get(k + 1)
+            // `bash -c -- 'script'`: `--` ends the options before the script.
+            && let Some(arg) = words.get(if words.get(k + 1).and_then(|w| w.word.lit()) == Some("--") { k + 2 } else { k + 1 })
         {
             let mut prefix = wrapped.clone();
             prefix.push(format!("{head} -c"));
             let start = self.out.len();
-            match &arg.word {
-                Word::Lit(text) => {
-                    let mut c2 = ctx.clone();
-                    c2.stack.clear();
-                    for (k, v) in &env {
-                        set_env(&mut c2.exports, k.clone(), v.clone());
-                    }
-                    self.run_text(text, &mut c2, depth);
-                }
-                Word::Dynamic(raw) => {
-                    let s = self.simple(
-                        ctx,
-                        vec![Word::Dynamic(raw.clone())],
-                        &env,
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    self.out.push(s);
-                }
-            }
+            let mut c2 = ctx.clone();
+            c2.stack.clear();
+            self.run_words_as_text(std::iter::once(arg), &env, &mut c2, depth);
             self.prefix_wrappers(start, &prefix, None);
             self.outer_redirects(ctx, plain, &env, redirs, wrapped);
             return;
@@ -1155,30 +1275,12 @@ impl Run<'_> {
             let mut prefix = wrapped.clone();
             prefix.push("eval".to_string());
             let start = self.out.len();
-            if words[1..].iter().all(|w| !w.word.is_dynamic()) {
-                let text = words[1..]
-                    .iter()
-                    .map(|w| w.lit.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if env.is_empty() {
-                    self.run_text(&text, ctx, depth);
-                } else {
-                    let mut c2 = ctx.clone();
-                    c2.stack.clear();
-                    for (k, v) in &env {
-                        set_env(&mut c2.exports, k.clone(), v.clone());
-                    }
-                    self.run_text(&text, &mut c2, depth);
-                }
+            if env.is_empty() {
+                self.run_words_as_text(words[1..].iter(), &env, ctx, depth);
             } else {
-                let raw = words[1..]
-                    .iter()
-                    .map(|w| w.raw.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let s = self.simple(ctx, vec![Word::Dynamic(raw)], &env, Vec::new(), Vec::new());
-                self.out.push(s);
+                let mut c2 = ctx.clone();
+                c2.stack.clear();
+                self.run_words_as_text(words[1..].iter(), &env, &mut c2, depth);
             }
             self.prefix_wrappers(start, &prefix, None);
             self.outer_redirects(ctx, plain, &env, redirs, wrapped);
@@ -1585,7 +1687,7 @@ mod tests {
     fn shell_c_dynamic() {
         let r = p(r#"bash -c "$CMD""#);
         assert_eq!(r.commands.len(), 1);
-        assert_eq!(r.commands[0].words, vec![Word::Dynamic("\"$CMD\"".into())]);
+        assert_eq!(r.commands[0].words, vec![Word::Dynamic("$CMD".into())]);
         assert_eq!(r.commands[0].wrapped_by, v(&["bash -c"]));
         let r = p("eval \"$x\"");
         assert_eq!(r.commands.len(), 1);
@@ -1842,5 +1944,49 @@ mod tests {
         assert_eq!(normalize(""), ".");
         assert_eq!(join_dir("/w", "api/"), "/w/api");
         assert_eq!(join_dir("/w", "/x"), "/x");
+    }
+
+    #[test]
+    fn computed_scripts_are_parsed_as_far_as_they_are_literal() {
+        // The literal parts of a double-quoted script are read; a computed
+        // word stays computed.
+        let r = p(r#"bash -c "cd api && echo $X && git stash""#);
+        let git = r.commands.iter().find(|s| s.words.first() == Some(&Word::Lit("git".into()))).unwrap();
+        assert_eq!(git.dir, "/w/api");
+        assert_eq!(git.wrapped_by, v(&["bash -c"]));
+        let r = p(r#"eval "$x""#);
+        assert_eq!(r.commands.len(), 1);
+        assert_eq!(r.commands[0].words, vec![Word::Dynamic("$x".into())]);
+        assert_eq!(r.commands[0].wrapped_by, v(&["eval"]));
+        // `\$` inside the double quotes is expanded by the inner shell.
+        let r = p(r#"sh -c "git \$SUB""#);
+        assert_eq!(r.commands[0].words, vec![Word::Lit("git".into()), Word::Dynamic("$SUB".into())]);
+    }
+
+    #[test]
+    fn dash_c_after_double_dash_and_options_with_values() {
+        assert_eq!(progs("bash -c -- 'git stash'"), vec![v(&["git", "stash"])]);
+        assert_eq!(progs("bash --rcfile /dev/null -c 'git stash'"), vec![v(&["git", "stash"])]);
+    }
+
+    #[test]
+    fn env_and_sudo_change_directory_for_the_command_only() {
+        for cmd in ["env -C api git stash", "env -Capi git stash", "env --chdir=api git stash", "env --chdir api git stash", "sudo -D api git stash", "sudo --chdir=api git stash"] {
+            let r = p(&format!("{cmd}; git status"));
+            assert_eq!(r.commands[0].dir, "/w/api", "{cmd}");
+            assert_eq!(lits(&r.commands[0]), v(&["git", "stash"]), "{cmd}");
+            assert_eq!(r.commands[1].dir, "/w", "{cmd}: the directory does not leak");
+        }
+        let r = p("env -i -C /x git stash");
+        assert_eq!(r.commands[0].dir, "/x");
+        assert!(r.commands[0].dir_known);
+    }
+
+    #[test]
+    fn env_split_string_is_a_command() {
+        let r = p(r#"env -S "git stash""#);
+        assert_eq!(progs(r#"env -S "git stash""#), vec![v(&["git", "stash"])]);
+        assert_eq!(r.commands[0].wrapped_by, v(&["env"]));
+        assert_eq!(progs(r#"env --split-string="git add" a.txt"#), vec![v(&["git", "add", "a.txt"])]);
     }
 }

@@ -14,7 +14,7 @@ here=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)
 tcas_home=${TCAS_HOME:-$HOME/.tcas}
 
 for c in "$TCAS_BIN" "$tcas_home/bin/tcas" "$TCAS_BUILT"; do
-  if [ -n "$c" ] && [ -x "$c" ]; then
+  if [ -n "$c" ] && [ -x "$c" ] && [ ! -d "$c" ]; then
     exec "$c" "$@"
   fi
 done

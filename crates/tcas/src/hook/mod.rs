@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use tcas_core::abspath;
 use tcas_core::config::WorkspaceConfig;
 use tcas_core::exempt;
+use tcas_core::guard;
 use tcas_core::proto::{HookRequest, HookResponse};
+use tcas_core::shell;
 use tcas_sys::fsys;
 use tcas_sys::home::Home;
 use tcasd::wsjson::{RootEntry, WsEntry, WsJson};
@@ -52,6 +54,8 @@ pub struct Local {
     pub home: Home,
     /// `home` with symlinks resolved.
     pub home_real: String,
+    /// `home` is on a case-insensitive volume.
+    pub home_ci: bool,
     pub wss: Vec<WsEntry>,
     pub exempt: Vec<exempt::ExemptDir>,
 }
@@ -60,13 +64,14 @@ impl Local {
     pub fn load() -> Local {
         let home = Home::from_env();
         let home_real = fsys::to_str(&std::fs::canonicalize(&home.dir).unwrap_or_else(|_| home.dir.clone()));
+        let home_ci = fsys::case_insensitive(Path::new(&home_real));
         let parsed: Option<WsJson> =
             std::fs::read_to_string(home.workspaces_json()).ok().and_then(|t| serde_json::from_str(&t).ok());
         let (wss, exempt) = match parsed {
             Some(j) => (j.workspaces, j.exempt),
             None => (vec![], vec![]),
         };
-        Local { home, home_real, wss, exempt }
+        Local { home, home_real, home_ci, wss, exempt }
     }
 
     pub fn has_workspaces(&self) -> bool {
@@ -97,7 +102,7 @@ impl Local {
     /// Paths only the user may change (harness.md section 4 step 1).
     pub fn protected(&self, abs: &str) -> Option<String> {
         let home = fsys::to_str(&self.home.dir);
-        if abspath::contains(&home, abs, false) || abspath::contains(&self.home_real, abs, false) {
+        if abspath::contains(&home, abs, self.home_ci) || abspath::contains(&self.home_real, abs, self.home_ci) {
             return Some(format!(
                 "tcas: {abs} is part of tcas's own configuration and data. Only the user can change it; tell the \
                  user what you need."
@@ -123,6 +128,69 @@ impl Local {
         let text = std::fs::read_to_string(Path::new(&first.path).join(".tcas.toml")).ok()?;
         tcas_core::config::parse_workspace(&text).ok()
     }
+}
+
+/// The subcommands a session's `tcas` command is approved for (harness.md
+/// section 5.5).
+const APPROVED: &[&[&str]] = &[
+    &["lease", "acquire"],
+    &["lease", "release"],
+    &["lease", "list"],
+    &["lease", "who"],
+    &["lease", "wait"],
+    &["status"],
+    &["workspace", "list"],
+    &["session", "list"],
+    &["exempt", "list"],
+    &["log"],
+    &["stats"],
+    &["doctor"],
+    &["whoami"],
+];
+
+/// A session's `tcas` command (its words, without `--json`) is one hooks
+/// approve: a listed subcommand, and not the user-only `--force` of
+/// `lease release` (daemon-and-cli.md section 5).
+pub fn approved(words: &[&str]) -> bool {
+    APPROVED.iter().any(|sub| words.len() >= sub.len() && words[..sub.len()] == **sub)
+        && !words.iter().any(|w| *w == "--force" || *w == "-f")
+}
+
+/// Arguments or redirect targets naming tcas's home or a workspace's
+/// `.tcas.toml` (harness.md section 5.1). Read-only programs may name them.
+pub fn protected_in(local: &Local, parsed: &shell::Parsed) -> Option<String> {
+    for c in &parsed.commands {
+        let args: Vec<&str> =
+            if guard::is_read_only(c) { vec![] } else { c.words.iter().skip(1).map(|w| w.text()).collect() };
+        for w in args.into_iter().chain(c.redirects.iter().map(|w| w.text())) {
+            let w = if w.starts_with('-') { w.split_once('=').map(|(_, v)| v).unwrap_or("") } else { w };
+            if w.is_empty() {
+                continue;
+            }
+            if let Some(r) = local.protected(&abs(&c.dir, w)) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// Directories a Bash command acts in, symlinks resolved: its own, every
+/// `cd`, and every `git -C`, `--work-tree` or `--git-dir` (harness.md
+/// section 5.1: a command run from outside a workspace that reaches into one
+/// is still guarded).
+pub fn bash_dirs(cwd: &str, parsed: &shell::Parsed) -> Vec<String> {
+    let mut dirs: Vec<String> = vec![cwd.to_string()];
+    for c in &parsed.commands {
+        dirs.push(abs(cwd, &c.dir));
+        if let Some(g) = guard::git_call(c) {
+            dirs.push(abs(cwd, &g.dir));
+            dirs.push(abs(cwd, &g.work_dir()));
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// An absolute, normalized form of a path from the harness.

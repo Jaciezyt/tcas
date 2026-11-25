@@ -66,6 +66,12 @@ fn commit_one(r: &CommitRepo, message: &str) -> Result<String, String> {
     Ok(h.trim().to_string())
 }
 
+fn warn(x: &Ctx, why: &str) {
+    if !x.json {
+        eprintln!("tcas: committed, but tcasd did not take the commit ({why}); the git hook reports it as well.");
+    }
+}
+
 pub fn run(x: &Ctx, message: &str, paths: Vec<String>) -> Result<i32, i32> {
     if message.trim().is_empty() {
         return Err(x.fail("bad_request", "a commit message is required: tcas commit -m \"…\""));
@@ -87,10 +93,26 @@ pub fn run(x: &Ctx, message: &str, paths: Vec<String>) -> Result<i32, i32> {
             Ok(h) => {
                 // The post-commit hook reported it already when installed;
                 // reporting again is harmless (each commit counts once).
-                let d = x.call("commit.done", json!({ "repo": r.abs, "hash": h, "paths": r.paths }))?;
-                let d: CommitDone = serde_json::from_value(d).unwrap_or_default();
+                // The commit is made either way; a failure here only leaves
+                // the released leases unreported.
+                let d: CommitDone = match x.c.call("commit.done", json!({ "repo": r.abs, "hash": h, "paths": r.paths })) {
+                    Ok(resp) if resp.ok => resp.result.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+                    Ok(resp) => {
+                        warn(x, &resp.error.map(|e| e.message).unwrap_or_default());
+                        CommitDone::default()
+                    }
+                    Err(e) => {
+                        warn(x, &e);
+                        CommitDone::default()
+                    }
+                };
                 released.extend(d.released);
-                still = d.still_held;
+                // Leases still held, over every workspace committed in.
+                for p in d.still_held {
+                    if !still.iter().any(|q| q.abs == p.abs && q.is_dir == p.is_dir) {
+                        still.push(p);
+                    }
+                }
                 made.push(Made { repo: r.display.clone(), hash: Some(h), shown: r.shown.clone(), error: None });
             }
             Err(e) => {

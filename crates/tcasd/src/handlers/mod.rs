@@ -97,17 +97,9 @@ pub fn with_tx(d: &'static Daemon, req: &Request, f: impl FnOnce(&mut Env) -> R<
 }
 
 /// Runs `f` in one transaction. The caller may hold the waits lock (waits
-/// are always locked before the database) and passes their summary.
-pub fn with_tx_inner<T>(
-    d: &'static Daemon,
-    req: &Request,
-    waiting: std::collections::HashMap<String, Vec<String>>,
-    f: impl FnOnce(&mut Env) -> R<T>,
-) -> R<T> {
-    let (v, _) = with_tx_inner_freed(d, req, waiting, f)?;
-    Ok(v)
-}
-
+/// are always locked before the database) and passes their summary. Paths
+/// freed on the way are returned for [`notify_freed`], which the caller runs
+/// once it has let go of the waits.
 pub fn with_tx_inner_freed<T>(
     d: &'static Daemon,
     req: &Request,

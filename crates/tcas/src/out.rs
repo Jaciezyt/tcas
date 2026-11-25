@@ -595,6 +595,10 @@ pub fn status(o: &Out, s: &StatusResult) -> i32 {
         println!("workspace  {}   mode {}", o.tilde(&ws.roots.first().map(|r| r.path.clone()).unwrap_or_default()), ws.mode);
         repo_lines(o, ws, None);
     }
+    // Who opened it, when a session did (daemon-and-cli.md section 5).
+    if ws.opened_by != "user" {
+        println!("opened by  {}", short_session(&ws.opened_by));
+    }
     println!();
     if s.sessions.is_empty() {
         println!("no sessions.");

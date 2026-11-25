@@ -2,7 +2,7 @@
 
 /// `41s`, `3m`, `52m`, `1h`, `2h5m`, `3d`.
 pub fn duration(ms: i64) -> String {
-    let s = (ms.max(0) + 500) / 1000;
+    let s = ms.max(0).saturating_add(500) / 1000;
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {
@@ -52,5 +52,10 @@ mod tests {
         assert_eq!(short_session("claude:79583356-aaaa"), "claude:7958…");
         assert_eq!(short_session("A"), "A");
         assert_eq!(short_session("manual:alpha"), "manual:alpha");
+    }
+
+    #[test]
+    fn huge_durations_do_not_overflow() {
+        assert!(duration(i64::MAX).ends_with('d'));
     }
 }

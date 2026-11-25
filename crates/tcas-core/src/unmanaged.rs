@@ -160,4 +160,11 @@ mod tests {
         assert!(matches_rule(&ci, "web/Cargo.lock"));
         assert!(!matches_rule(&rule("Web", "*.LOCK", false), "web/Cargo.lock"));
     }
+
+    #[test]
+    fn case_folding_that_changes_length_does_not_panic() {
+        let r = UnmanagedRule { base_rel: "i\u{307}".into(), pattern: "*.lock".into(), source: "t".into(), ci: true };
+        assert!(matches_rule(&r, "İ/x.lock"));
+        assert!(!matches_rule(&r, "İ/x.ts"));
+    }
 }

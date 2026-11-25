@@ -188,15 +188,15 @@ pub fn verdict(l: &LeaseFacts, h: &HolderFacts, now: i64, lim: &Limits) -> Verdi
         return v(Yield::IfClean, Why::Implicit, None);
     }
 
-    // Waited-for leases are kept for a grace period after the grant.
-    if l.source == Source::Wait {
+    // Waited-for file leases are kept for a grace period after the grant. A
+    // waited-for directory, or a file outside a checkout, is explicit
+    // (leases.md sections 4 and 7).
+    if l.source == Source::Wait && l.in_repo && !l.is_prefix {
         let until = l.acquired_at + lim.waited_grace_ms;
         if now < until {
             return v(Yield::Never, Why::Grace, Some(until));
         }
-        if l.in_repo && !l.is_prefix {
-            return v(Yield::IfClean, Why::GraceOver, None);
-        }
+        return v(Yield::IfClean, Why::GraceOver, None);
     }
 
     // Explicit leases, every directory lease, and files outside a checkout.
@@ -304,5 +304,19 @@ mod tests {
         assert!(!covers("src/a.ts", false, "src", true));
         assert!(covers("a.txt", false, "a.txt", false));
         assert!(!covers("src/auth", true, "src", true));
+    }
+
+    #[test]
+    fn waited_directory_is_explicit() {
+        // No grace period: a waited-for directory follows the explicit rules
+        // (leases.md section 7), so it yields once committed under and idle.
+        let d = LeaseFacts { is_prefix: true, committed_at: Some(1), ..lease(Source::Wait) };
+        assert_eq!(verdict(&d, &IDLE, 2, &LIM).why, Why::Committed);
+        assert_eq!(y(&d, &LIVE, 2), Yield::Never);
+        assert_eq!(y(&d, &LIVE, 1_800_000), Yield::Now);
+        let out = LeaseFacts { in_repo: false, ..lease(Source::Wait) };
+        assert_eq!(verdict(&out, &LIVE, 2, &LIM).why, Why::Held);
+        let f = lease(Source::Wait);
+        assert_eq!(verdict(&f, &IDLE, 2, &LIM).why, Why::Grace);
     }
 }

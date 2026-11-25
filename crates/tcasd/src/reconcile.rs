@@ -40,7 +40,10 @@ pub struct RepoSnap {
     pub ci: bool,
     pub common_dir: Option<String>,
     /// Nested checkouts and exempt directories, relative to this checkout.
-    skip: Vec<String>,
+    /// Directories whose changes belong to another snapshot (nested checkouts,
+    /// exempt directories). With `false` the path itself still counts: a
+    /// submodule's recorded commit is a path of the outer repository.
+    skip: Vec<(String, bool)>,
     /// `git status` ran.
     pub ok: bool,
     pub head: Option<String>,
@@ -96,12 +99,15 @@ struct Job {
     abs: PathBuf,
     ci: bool,
     common_dir: Option<String>,
-    skip: Vec<String>,
+    /// Directories whose changes belong to another snapshot (nested checkouts,
+    /// exempt directories). With `false` the path itself still counts: a
+    /// submodule's recorded commit is a path of the outer repository.
+    skip: Vec<(String, bool)>,
 }
 
-fn under_skip(skip: &[String], p: &str, ci: bool) -> bool {
+fn under_skip(skip: &[(String, bool)], p: &str, ci: bool) -> bool {
     let k = relpath::key(p.trim_end_matches('/'), ci);
-    skip.iter().any(|s| relpath::contains(s, &k))
+    skip.iter().any(|(s, itself)| relpath::contains(s, &k) && (*itself || *s != k))
 }
 
 fn take(git: &Git, j: Job) -> RepoSnap {
@@ -172,15 +178,17 @@ fn jobs_for(global_exempt: &[ExemptDir], ws: &Ws) -> Vec<Job> {
             continue;
         }
         let dk = relpath::key(&r.dir, ci);
-        let mut skip: Vec<String> = ws
+        // Nested checkouts snapshot their own files (harness.md section 5.2);
+        // a submodule's path itself stays, as its recorded commit.
+        let mut skip: Vec<(String, bool)> = ws
             .repos
             .iter()
             .filter(|o| o.root == r.root && o.dir != r.dir && relpath::contains(&dk, &relpath::key(&o.dir, ci)))
-            .map(|o| relpath::key(&relpath::strip(&r.dir, &o.dir), ci))
+            .map(|o| (relpath::key(&relpath::strip(&r.dir, &o.dir), ci), o.kind != "submodule"))
             .collect();
         for e in global_exempt.iter().chain(ws.exempt.iter()) {
             if abspath::contains(&abs_s, &e.path, ci) && e.path.len() > abs_s.len() {
-                skip.push(relpath::key(&abspath::relative(&abs_s, &e.path), ci));
+                skip.push((relpath::key(&abspath::relative(&abs_s, &e.path), ci), true));
             }
         }
         out.push(Job { ws: ws.row.id.clone(), root: r.root.clone(), dir: r.dir.clone(), abs, ci, common_dir: r.common_dir.clone(), skip });
@@ -221,10 +229,10 @@ fn targets(env: &Env, sid: &str, command: &str) -> R<BTreeSet<String>> {
     for s in &parsed.commands {
         let mut dirs = vec![(s.dir.clone(), s.dir_known)];
         if let Some(c) = guard::git_call(s) {
-            dirs.push((c.dir.clone(), c.dir_known));
+            dirs.push((c.work_dir(), c.dir_known));
         }
         for (d, known) in dirs {
-            if known && let Some((ws, _)) = env.world.root_of(&d) {
+            if known && let Some((ws, _)) = env.world.root_of(&crate::bashguard::real_dir(&d)) {
                 ids.insert(ws.row.id.clone());
             }
         }

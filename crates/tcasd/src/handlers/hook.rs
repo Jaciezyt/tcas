@@ -358,9 +358,10 @@ fn stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
         reconcile::promote_foreground_bash(env.d, sid);
     } else {
         let mut rep = reconcile::Reported::default();
-        reconcile::close_foreground(env, sid, None, &mut rep)?;
-        reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?;
+        let mut said = reconcile::close_foreground(env, sid, None, &mut rep)?;
+        said.extend(reconcile::close_background(env, sid, h.background_running.as_deref(), &mut rep)?);
         env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent IS NULL AND background_id IS NULL", [sid])?;
+        queue_hints(env, sid, said)?;
     }
     env.c.execute("UPDATE session SET state='idle', turn=turn+1 WHERE id=?1 AND state!='ended'", [sid])?;
     Ok(HookResponse::default())
@@ -369,10 +370,22 @@ fn stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
 fn agent_stop(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
     if let Some(a) = &h.agent {
         let mut rep = reconcile::Reported::default();
-        reconcile::close_foreground(env, sid, Some(a), &mut rep)?;
+        let said = reconcile::close_foreground(env, sid, Some(a), &mut rep)?;
         env.c.execute("DELETE FROM open_call WHERE session=?1 AND agent=?2 AND background_id IS NULL", params![sid, a])?;
+        queue_hints(env, sid, said)?;
     }
     Ok(HookResponse::default())
+}
+
+/// What reconciling told the session, kept for its next hook that can
+/// inject text (harness.md section 6): `Stop` and `SubagentStop` cannot.
+fn queue_hints(env: &Env, sid: &str, said: Vec<String>) -> R<()> {
+    for item in said {
+        if !item.is_empty() {
+            env.notice(sid, "hint", json!({ "text": item }))?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -568,11 +581,7 @@ fn post_tool(env: &mut Env, sid: &str, h: &HookRequest) -> R<HookResponse> {
         }
     }
     if h.defer_context {
-        for item in extra {
-            if !item.is_empty() {
-                env.notice(sid, "hint", json!({ "text": item }))?;
-            }
-        }
+        queue_hints(env, sid, extra)?;
         return Ok(HookResponse::default());
     }
     Ok(with_context(deliver(env, sid, extra)?))

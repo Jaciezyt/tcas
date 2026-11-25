@@ -260,7 +260,8 @@ enum DaemonCmd {
     Stop,
     /// Whether tcasd is running.
     Status,
-    /// Run tcasd in the foreground.
+    /// Run tcasd in the foreground (used to start it when the tcasd program is missing).
+    #[command(hide = true)]
     Run,
 }
 
@@ -716,8 +717,17 @@ fn daemon(x: &Ctx, d: DaemonCmd) -> Result<i32, i32> {
             0
         }
         DaemonCmd::Stop => {
+            // User only (daemon-and-cli.md section 5), whether or not it runs.
+            if x.c.session.is_some() {
+                return Err(x.fail(
+                    code::USER_ONLY,
+                    "tcas daemon stop is for the user: stopping tcasd stops every session's edits. Tell the user if it needs doing.",
+                ));
+            }
             let Ok(mut s) = x.c.connect() else {
-                if !x.json {
+                if x.json {
+                    print_json(&json!({ "running": false, "stopped": false }));
+                } else {
                     println!("tcasd is not running.");
                 }
                 return Ok(0);

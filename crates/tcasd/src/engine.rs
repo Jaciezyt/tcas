@@ -225,7 +225,7 @@ pub fn tracked_under(env: &Env, ws: &Ws, root: &str, rel_dir: &str) -> Vec<Strin
         let rk = relpath::key(&r.dir, ci);
         let repo_abs = ws.repo_abs(root, &r.dir);
         if relpath::contains(&rk, &dk) {
-            let sub = if rk == dk { String::new() } else { rel_dir[r.dir.len() + usize::from(!r.dir.is_empty())..].to_string() };
+            let sub = relpath::strip(&r.dir, rel_dir);
             for f in env.d.git.ls_files(&repo_abs, &sub, ci) {
                 out.insert(relpath::join(&r.dir, &f));
             }
@@ -307,13 +307,18 @@ pub fn release_with_commit(env: &Env, l: &LeaseRow, reason: &str, by: Option<&st
         )?;
     }
     store::delete_lease(env.c, l)?;
+    // Hints about this lease go with it; for a directory, those about the
+    // files under it too (they were given while it covered them).
+    let under = if l.is_prefix { 1 } else { 0 };
     env.c.execute(
-        "DELETE FROM read_hint WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
-        params![l.workspace, l.root, l.path_key, l.session],
+        "DELETE FROM read_hint WHERE workspace=?1 AND root=?2 AND holder=?4 \
+         AND (path_key=?3 OR (?5 AND substr(path_key, 1, length(?3) + 1) = ?3 || '/'))",
+        params![l.workspace, l.root, l.path_key, l.session, under],
     )?;
     env.c.execute(
-        "DELETE FROM wait_notified WHERE workspace=?1 AND root=?2 AND path_key=?3 AND holder=?4",
-        params![l.workspace, l.root, l.path_key, l.session],
+        "DELETE FROM wait_notified WHERE workspace=?1 AND root=?2 AND holder=?4 \
+         AND (path_key=?3 OR (?5 AND substr(path_key, 1, length(?3) + 1) = ?3 || '/'))",
+        params![l.workspace, l.root, l.path_key, l.session, under],
     )?;
     let turn = session_turn(env.c, &l.session);
     let mut p = json!({
@@ -839,10 +844,29 @@ pub fn acquire(env: &Env, req: &AcqReq) -> R<Acq> {
                 let new_brief = if exact && brief.is_some() { brief.clone() } else { l.brief.clone() };
                 let mark_bash_edit = exact && !r.is_dir && req.source == Source::Bash && l.edited_at.is_none();
                 let new_edited_at = if mark_bash_edit { Some(env.now) } else { l.edited_at };
+                // Asking for it again starts it over: an earlier commit no longer
+                // lets it go once the turn ends (leases.md section 6).
+                let reacquired = exact && matches!(req.source, Source::Cli | Source::Grant);
                 env.c.execute(
-                    "UPDATE lease SET touched_at=?4, source=?5, brief=?6, edited_at=?7 WHERE workspace=?1 AND root=?2 AND path_key=?3",
-                    params![l.workspace, l.root, l.path_key, env.now, source.as_str(), new_brief, new_edited_at],
+                    "UPDATE lease SET touched_at=?4, source=?5, brief=?6, edited_at=?7, \
+                     committed_at=CASE WHEN ?8 THEN NULL ELSE committed_at END \
+                     WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                    params![l.workspace, l.root, l.path_key, env.now, source.as_str(), new_brief, new_edited_at, reacquired],
                 )?;
+                // Using a file under the session's own directory lease uses the
+                // directory too (leases.md section 6, "用到").
+                for o in leases.iter().filter(|o| {
+                    o.session == req.session
+                        && o.is_prefix
+                        && o.root == m.root
+                        && o.path_key != l.path_key
+                        && relpath::contains(&o.path_key, &m.key)
+                }) {
+                    env.c.execute(
+                        "UPDATE lease SET touched_at=?4 WHERE workspace=?1 AND root=?2 AND path_key=?3",
+                        params![o.workspace, o.root, o.path_key, env.now],
+                    )?;
+                }
                 if mark_bash_edit && !l.source.is_implicit() {
                     env.event(
                         Some(&ws_id),

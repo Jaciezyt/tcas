@@ -90,14 +90,18 @@ pub fn path(harness: &str, json: bool) -> i32 {
     match write(&Home::from_env(), harness) {
         Ok(dir) => {
             if json {
-                println!("{}", serde_json::json!({ "harness": harness, "path": dir }));
+                crate::print_json(&serde_json::json!({ "harness": harness, "path": dir }));
             } else {
                 println!("{}", dir.display());
             }
             0
         }
         Err(e) => {
-            eprintln!("tcas: {e}");
+            if json {
+                crate::print_json(&serde_json::json!({ "ok": false, "error": { "code": "bad_request", "message": e } }));
+            } else {
+                eprintln!("tcas: {e}");
+            }
             1
         }
     }

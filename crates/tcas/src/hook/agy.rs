@@ -8,7 +8,7 @@ use tcas_core::guard;
 use tcas_core::proto::{HookRequest, HookResponse, HookTool};
 use tcas_core::shell;
 
-use super::{Local, abs, contact, harness_pid, unavailable};
+use super::{Local, abs, approved, bash_dirs, contact, harness_pid, protected_in, unavailable};
 
 const EDIT_TOOLS: &[&str] = &[
     "edit_file",
@@ -26,24 +26,6 @@ const READ_TOOLS: &[&str] = &[
     "grep_search",
     "find_by_name",
     "list_dir",
-];
-
-/// The subcommands a session's `tcas` command is approved for (harness.md
-/// section 5.5).
-const APPROVED: &[&[&str]] = &[
-    &["lease", "acquire"],
-    &["lease", "release"],
-    &["lease", "list"],
-    &["lease", "who"],
-    &["lease", "wait"],
-    &["status"],
-    &["workspace", "list"],
-    &["session", "list"],
-    &["exempt", "list"],
-    &["log"],
-    &["stats"],
-    &["doctor"],
-    &["whoami"],
 ];
 
 fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -420,7 +402,7 @@ fn pre_command(
     if let Some(tcas_args) = guard::tcas_command(&parsed) {
         let words: Vec<&str> = tcas_args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
         let is_wait = words.len() >= 2 && words[0] == "lease" && words[1] == "wait";
-        let approved = APPROVED.iter().any(|sub| words.len() >= sub.len() && words[..sub.len()] == **sub);
+        let approved = approved(&words);
         if is_wait && !background {
             if approve {
                 decision(
@@ -447,13 +429,7 @@ fn pre_command(
         return;
     }
 
-    let mut dirs: Vec<String> = vec![cwd.to_string()];
-    for c in &parsed.commands {
-        dirs.push(c.dir.clone());
-        if let Some(g) = guard::git_call(c) {
-            dirs.push(g.dir.clone());
-        }
-    }
+    let dirs = bash_dirs(cwd, &parsed);
     let concerns = dirs.iter().any(|d| local.managed(d));
     let known = local.marked(sid) || (base.subagent_candidate && any_agy_marked(local));
     if !(concerns || known) {
@@ -476,23 +452,6 @@ fn pre_command(
         Err(e) if concerns => decision("deny", &unavailable(&e), None),
         Err(_) => {}
     }
-}
-
-fn protected_in(local: &Local, parsed: &shell::Parsed) -> Option<String> {
-    for c in &parsed.commands {
-        let args: Vec<&str> =
-            if guard::is_read_only(c) { vec![] } else { c.words.iter().skip(1).map(|w| w.text()).collect() };
-        for w in args.into_iter().chain(c.redirects.iter().map(|w| w.text())) {
-            let w = if w.starts_with('-') { w.split_once('=').map(|(_, v)| v).unwrap_or("") } else { w };
-            if w.is_empty() {
-                continue;
-            }
-            if let Some(r) = local.protected(&shell::join_dir(&c.dir, w)) {
-                return Some(r);
-            }
-        }
-    }
-    None
 }
 
 fn wait_in_background(command: &str) -> String {

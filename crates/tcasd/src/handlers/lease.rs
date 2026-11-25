@@ -14,7 +14,7 @@ use tcas_core::lease::{LeaseState, Source};
 use tcas_core::proto::{AcquireResult, LeaseView, Outcome, ReleaseResult, Request, WhoEntry};
 use tcas_core::{relpath, wait as wg};
 
-use super::{args, with_tx_inner};
+use super::{args, notify_freed, with_tx_inner_freed};
 use crate::daemon::{Caller, Daemon, Fail, R};
 use crate::engine::{self, AcqReq, Ctx, Env};
 use crate::store::{self, LeaseRow};
@@ -109,8 +109,8 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
     let a: WaitArgs = args(req)?;
     let mut list = d.waits();
     let summary = list.summary();
-    let (sid, acq, deadline, started_at, cwd, snapshot, brief_sanitized, holder_keys, turn) =
-        with_tx_inner(d, req, summary, |env| {
+    let ((sid, acq, deadline, started_at, cwd, snapshot, brief_sanitized, holder_keys, turn), freed) =
+        with_tx_inner_freed(d, req, summary, |env| {
             let sid = env.caller.require_session("tcas lease wait")?.to_string();
             let turn = engine::session_turn(env.c, &sid);
             if a.paths.is_empty() {
@@ -157,6 +157,11 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
                 .collect();
             Ok((sid, acq, started_at + timeout * 1000, started_at, env.cwd.clone(), snapshot, brief_sanitized, holder_keys, turn))
         })?;
+    if !freed.is_empty() {
+        // Paths freed on the way (a clean orphan, say) are announced once this
+        // thread lets go of the waits, which `notify_freed` needs.
+        std::thread::spawn(move || notify_freed(d, freed));
+    }
     let now = tcas_sys::clock::now_ms();
     let mut result = acq.result;
     if result.outcome != Outcome::Denied {
@@ -213,6 +218,7 @@ pub fn wait(d: &'static Daemon, req: &Request, stream: &UnixStream) -> R<Value> 
         cwd,
         inputs: a.paths.clone(),
         wanted: result.wanted.iter().map(|p| p.display.clone()).collect(),
+        wanted_refs: result.wanted.clone(),
         brief: a.brief.clone(),
         started_at,
         deadline,

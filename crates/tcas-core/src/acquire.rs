@@ -88,7 +88,9 @@ pub fn decide(
     lim: &Limits,
 ) -> Decision {
     let mut d = Decision { covered: vec![None; wants.len()], ..Default::default() };
-    let mut seen: Vec<Option<(Yield, Why, bool, Option<i64>)>> = vec![None; held.len()];
+    // Per lease, once looked at: (verdict, why, dirty, until).
+    type Seen = Option<(Yield, Why, bool, Option<i64>)>;
+    let mut seen: Vec<Seen> = vec![None; held.len()];
 
     for (wi, w) in wants.iter().enumerate() {
         d.covered[wi] = own_cover(session, w, held);

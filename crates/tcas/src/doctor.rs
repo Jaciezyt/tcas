@@ -7,7 +7,6 @@ use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use serde_json::json;
-use tcas_core::config::GlobalConfig;
 use tcas_core::exempt;
 use tcas_core::human;
 use tcas_core::proto::{
@@ -279,7 +278,7 @@ fn inspect_local(x: &Ctx, cwd: &Path, git: &tcasd::git::Git) -> LocalState {
                     .and_then(|r| std::fs::read_to_string(Path::new(&r.path).join(".tcas.toml")).ok())
                     .and_then(|t| tcas_core::config::parse_workspace(&t).ok())
                     .unwrap_or_default();
-                let mode = first_cfg.mode.unwrap_or_else(|| GlobalConfig::default().defaults.mode);
+                let mode = first_cfg.mode.unwrap_or(g.cfg.defaults.mode);
                 let all_roots: Vec<(String, bool)> =
                     wj.workspaces.iter().flat_map(|x| x.roots.iter().map(|r| (r.path.clone(), r.case_insensitive))).collect();
                 let mut ex = g.exempt.clone();

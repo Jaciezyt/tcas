@@ -177,6 +177,14 @@ impl Daemon {
         self.global_checked().0
     }
 
+    /// Reads `config.toml` again after tcasd wrote it: a rewrite within the
+    /// file system's time granularity keeps the modification time.
+    pub fn reload_global(&self) -> Global {
+        let fresh = load_global(&self.home);
+        *self.global.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+        fresh
+    }
+
     /// Wakes the wait evaluator.
     pub fn kick(&self) {
         let mut k = self.kick_flag.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,11 +216,20 @@ pub fn identify(
     cwd: &str,
     now: i64,
 ) -> R<Caller> {
+    // A subagent's command (AGY gives it its own ID, harness.md section 10)
+    // runs as its live parent, and does not move the parent's directory.
+    let mut subagent = false;
     let sid = match session.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             let aliased: Option<String> = c
-                .query_row("SELECT parent FROM session_alias WHERE alias=?1", [s], |r| r.get(0))
+                .query_row(
+                    "SELECT a.parent FROM session_alias a JOIN session p ON p.id = a.parent \
+                     WHERE a.alias=?1 AND p.state != 'ended'",
+                    [s],
+                    |r| r.get(0),
+                )
                 .ok();
+            subagent = aliased.is_some();
             Some(aliased.unwrap_or_else(|| s.to_string()))
         }
         None => {
@@ -239,7 +256,8 @@ pub fn identify(
         }
     };
     let Some(sid) = sid else { return Ok(Caller::User) };
-    seen(c, home, &sid, &Seen { cwd: Some(cwd), pid: None, create: true, activate: true, via: "cli" }, now)?;
+    let cwd = if subagent { None } else { Some(cwd) };
+    seen(c, home, &sid, &Seen { cwd, pid: None, create: true, activate: true, via: "cli" }, now)?;
     Ok(Caller::Session(sid))
 }
 

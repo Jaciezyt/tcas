@@ -7,10 +7,9 @@ use tcas_sys::clock;
 use crate::out::Out;
 
 fn pct(part: usize, whole: usize) -> String {
-    if whole == 0 {
-        "0%".into()
-    } else {
-        format!("{}%", (part * 100 + whole / 2) / whole)
+    match (part * 100 + whole / 2).checked_div(whole) {
+        Some(p) => format!("{p}%"),
+        None => "0%".into(),
     }
 }
 

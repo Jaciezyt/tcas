@@ -56,7 +56,8 @@ pub fn discover(
     let root_s = root.to_string_lossy().into_owned();
     let mut checkouts: Vec<(PathBuf, &'static str)> = Vec::new();
     // (directory, depth, the innermost enclosing checkout and its excluded dirs)
-    let mut stack: Vec<(PathBuf, usize, Option<(PathBuf, std::rc::Rc<HashSet<String>>)>)> =
+    type Enclosing = Option<(PathBuf, std::rc::Rc<HashSet<String>>)>;
+    let mut stack: Vec<(PathBuf, usize, Enclosing)> =
         vec![(root.to_path_buf(), 0, None)];
     while let Some((dir, d, enclosing)) = stack.pop() {
         if exempt::find(exempt_list, &dir.to_string_lossy()).is_some() {

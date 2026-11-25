@@ -23,6 +23,8 @@ pub struct WaitEntry {
     pub inputs: Vec<String>,
     /// Display forms of the managed paths, for status.
     pub wanted: Vec<String>,
+    /// The managed paths, for the result when the wait ends without a grant.
+    pub wanted_refs: Vec<PathRef>,
     pub brief: Option<String>,
     pub started_at: i64,
     pub deadline: i64,
@@ -82,7 +84,13 @@ pub fn graph_with(waits: &Waits, session: &str, edges: &[(String, PathRef, PathR
     g
 }
 
-fn edge<'a>(waits: &'a Waits, extra: Option<(&'a str, &'a [(String, PathRef, PathRef)])>, from: &str, to: &str) -> Option<&'a (String, PathRef, PathRef)> {
+/// (holder, wanted path, held path): one edge of the wait graph.
+pub type Edge = (String, PathRef, PathRef);
+
+/// A waiting session and its edges not yet in [`Waits`].
+pub type Pending<'a> = Option<(&'a str, &'a [Edge])>;
+
+fn edge<'a>(waits: &'a Waits, extra: Pending<'a>, from: &str, to: &str) -> Option<&'a Edge> {
     if let Some((s, edges)) = extra
         && s == from
         && let Some(e) = edges.iter().find(|e| e.0 == to)
@@ -94,7 +102,7 @@ fn edge<'a>(waits: &'a Waits, extra: Option<(&'a str, &'a [(String, PathRef, Pat
 
 /// Describes a cycle through `me`: each other session, what it holds that the
 /// previous one wants, and what it waits for.
-pub fn describe(waits: &Waits, me: &str, extra: Option<(&str, &[(String, PathRef, PathRef)])>, cycle: &[String]) -> Vec<CycleStep> {
+pub fn describe(waits: &Waits, me: &str, extra: Pending<'_>, cycle: &[String]) -> Vec<CycleStep> {
     // cycle = [n1, n2, ..., me]; edges me→n1→...→me.
     let mut nodes = vec![me.to_string()];
     nodes.extend(cycle.iter().cloned());
@@ -125,8 +133,10 @@ pub fn evaluate(d: &Daemon) {
     let ids: Vec<u64> = waits.list.iter().map(|w| w.id).collect();
     for id in ids {
         let Some(idx) = waits.list.iter().position(|w| w.id == id) else { continue };
+        // Sessions that are waiting are not stalled (leases.md section 6).
+        let waiting = waits.summary();
         let w = &waits.list[idx];
-        let res = attempt(d, w, now);
+        let res = attempt(d, w, now, waiting);
         match res {
             Ok(Attempt::Granted(mut r)) => {
                 let w = waits.remove(id).expect("present");
@@ -170,6 +180,7 @@ pub fn evaluate(d: &Daemon) {
         let g = waits.graph();
         let mut r = AcquireResult::new(Outcome::Deadlock);
         r.session = w.session.clone();
+        r.wanted = w.wanted_refs.clone();
         let mut g2 = g.clone();
         for (h, _, _) in &w.edges {
             g2.entry(w.session.clone()).or_default().insert(h.clone());
@@ -188,7 +199,7 @@ enum Attempt {
     Gone,
 }
 
-fn attempt(d: &Daemon, w: &WaitEntry, now: i64) -> R<Attempt> {
+fn attempt(d: &Daemon, w: &WaitEntry, now: i64, waiting: HashMap<String, Vec<String>>) -> R<Attempt> {
     let mut conn = d.db();
     let tx = conn.transaction()?;
     if let Some(s) = crate::store::session(&tx, &w.session)?
@@ -205,7 +216,7 @@ fn attempt(d: &Daemon, w: &WaitEntry, now: i64) -> R<Attempt> {
         caller: Caller::Session(w.session.clone()),
         agent: None,
         cwd: w.cwd.clone(),
-        waiting: HashMap::new(),
+        waiting,
         freed: Default::default(),
     };
     let acq = engine::acquire(

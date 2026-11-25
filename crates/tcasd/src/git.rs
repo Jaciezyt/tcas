@@ -346,7 +346,9 @@ impl Git {
     /// Like [`dirty`] for the whole checkout, keeping the spelling git uses.
     pub fn changed_paths(&self, repo: &Path) -> Vec<String> {
         let mut c = self.cmd(repo);
-        c.args(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+        // A submodule's path counts when its recorded commit changed, not for
+        // changes inside it (those are the submodule's own paths).
+        c.args(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty"]);
         let mut out = Vec::new();
         let Ok(o) = c.output() else { return out };
         let mut it = o.stdout.split(|b| *b == 0);

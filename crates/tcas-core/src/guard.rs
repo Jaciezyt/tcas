@@ -25,6 +25,27 @@ pub struct GitCall {
     pub env: Vec<(String, Word)>,
 }
 
+impl GitCall {
+    /// The working tree the call acts on, as written (harness.md section 5.1):
+    /// `--work-tree`, else the checkout whose `.git` `--git-dir` names (or the
+    /// git directory itself), else the directory it runs in.
+    pub fn work_dir(&self) -> String {
+        if let Some(w) = &self.work_tree {
+            return shell::join_dir(&self.dir, w);
+        }
+        if let Some(g) = &self.git_dir {
+            let gd = shell::join_dir(&self.dir, g);
+            if shell::basename(&gd) == ".git"
+                && let Some((parent, _)) = gd.rsplit_once('/')
+            {
+                return if parent.is_empty() { "/".to_string() } else { parent.to_string() };
+            }
+            return gd;
+        }
+        self.dir.clone()
+    }
+}
+
 /// What a git invocation does, as far as the guard rules care.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -56,6 +77,9 @@ pub enum Action {
     Switch,
     /// `checkout <name>`: a branch or a path, the caller decides.
     CheckoutName(String),
+    /// `checkout <first> <paths…>`: `first` is a tree-ish when it names a
+    /// commit, otherwise one more path. The caller decides.
+    CheckoutPaths { first: String, paths: Vec<String> },
     /// `rebase merge pull cherry-pick revert am`, `apply` without `--check`; the subcommand.
     Rewrite(String),
     /// `worktree remove <dir>`; the dir as written.
@@ -190,8 +214,6 @@ const KNOWN: &[&str] = &[
     "patch-id",
     "stripspace",
     "show-index",
-    "ls-tree",
-    "rev-list",
     "multi-pack-index",
     "backfill",
     "survey",
@@ -244,9 +266,17 @@ pub fn git_call(s: &Simple) -> Option<GitCall> {
                 i += 2;
             }
             "-c" => {
-                if let Word::Lit(kv) = w.get(i + 1)? {
-                    let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
-                    c.config.push((k.to_string(), v.to_string()));
+                match w.get(i + 1)? {
+                    Word::Lit(kv) => {
+                        let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                        c.config.push((k.to_string(), v.to_string()));
+                    }
+                    // `-c alias.st=$X st`: what the alias does is computed.
+                    Word::Dynamic(raw) => {
+                        if raw.to_ascii_lowercase().starts_with("alias.") {
+                            c.dir_known = false;
+                        }
+                    }
                 }
                 i += 2;
             }
@@ -329,7 +359,21 @@ fn scan(args: &[Word], short_val: &str, short_opt: &str, long_val: &[&str]) -> S
             continue;
         }
         let Some(s) = w.lit() else {
-            r.pos.push(w.clone());
+            // An option whose value is computed (`--message="$MSG"`, `-m"$MSG"`)
+            // is still that option; anything else computed is a positional.
+            let t = w.text();
+            if let Some((name, _)) = t.strip_prefix("--").and_then(|l| l.split_once('='))
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                r.flags.push(format!("--{name}"));
+            } else if let Some(ch) = t.strip_prefix('-').and_then(|x| x.chars().next())
+                && (short_val.contains(ch) || short_opt.contains(ch))
+            {
+                r.flags.push(format!("-{ch}"));
+            } else {
+                r.pos.push(w.clone());
+            }
             continue;
         };
         if s == "--" {
@@ -368,6 +412,14 @@ fn texts<'a>(it: impl Iterator<Item = &'a Word>) -> Vec<String> {
     it.map(|w| w.text().to_string()).collect()
 }
 
+/// A pathspec naming the whole working tree, or all of the current directory:
+/// `.`, `./`, `:/`, `:(top)`, `:/.`, `:(top)./`.
+fn whole_tree(w: &Word) -> bool {
+    let Some(p) = w.lit() else { return false };
+    let rest = p.strip_prefix(":/").or_else(|| p.strip_prefix(":(top)")).unwrap_or(p);
+    !p.is_empty() && matches!(rest, "" | "." | "./")
+}
+
 /// Classify a git invocation.
 pub fn classify(c: &GitCall) -> Action {
     let sub = match &c.sub {
@@ -378,9 +430,9 @@ pub fn classify(c: &GitCall) -> Action {
     match sub {
         "add" | "stage" => {
             let s = scan(a, "", "", &["pathspec-from-file", "chmod"]);
-            if s.has(&["-A", "--all", "-u", "--update"])
-                || s.all().any(|w| matches!(w.lit(), Some("." | ":/")))
-            {
+            // `add -p`/`-i` with no paths goes through the whole tree.
+            let whole_patch = s.all().next().is_none() && s.has(&["-p", "--patch", "-i", "--interactive"]);
+            if s.has(&["-A", "--all", "-u", "--update"]) || s.all().any(whole_tree) || whole_patch {
                 Action::AddAll
             } else if s.any_dynamic() || s.has(&["--pathspec-from-file"]) {
                 Action::Dynamic
@@ -414,9 +466,10 @@ pub fn classify(c: &GitCall) -> Action {
                 Action::CommitAll
             } else if s.any_dynamic() || s.has(&["--pathspec-from-file"]) {
                 Action::Dynamic
-            } else if s.all().next().is_some() {
+            } else if s.all().next().is_some() && !s.has(&["-i", "--include"]) {
                 Action::CommitPaths(texts(s.all()))
             } else {
+                // `--include` commits what is staged as well as the paths.
                 Action::CommitStaged {
                     amend: s.has(&["--amend"]),
                 }
@@ -448,6 +501,9 @@ pub fn classify(c: &GitCall) -> Action {
                 Action::Allow
             } else if s.any_dynamic() || s.has(&["--pathspec-from-file"]) {
                 Action::Dynamic
+            } else if s.all().next().is_none() && s.has(&["-p", "--patch"]) {
+                // `restore -p` with no paths goes through the whole tree.
+                Action::RestorePaths(vec![".".into()])
             } else {
                 Action::RestorePaths(texts(s.all()))
             }
@@ -468,6 +524,7 @@ pub fn classify(c: &GitCall) -> Action {
                 Action::Dynamic
             } else {
                 match s.pos.as_slice() {
+                    [] if s.has(&["-p", "--patch"]) => Action::RestorePaths(vec![".".into()]),
                     [] => Action::Allow,
                     [Word::Dynamic(_)] => Action::Dynamic,
                     [Word::Lit(n)] if n == "-" => Action::Switch,
@@ -476,13 +533,13 @@ pub fn classify(c: &GitCall) -> Action {
                         Action::RestorePaths(vec![n.clone()])
                     }
                     [Word::Lit(n)] => Action::CheckoutName(n.clone()),
-                    [_, rest @ ..] => {
-                        if rest.iter().any(Word::is_dynamic) {
-                            Action::Dynamic
-                        } else {
-                            Action::RestorePaths(texts(rest.iter()))
+                    [Word::Lit(first), rest @ ..] if !rest.iter().any(Word::is_dynamic) => {
+                        Action::CheckoutPaths {
+                            first: first.clone(),
+                            paths: texts(rest.iter()),
                         }
                     }
+                    _ => Action::Dynamic,
                 }
             }
         }
@@ -590,6 +647,13 @@ pub fn sets_tcas_allow(s: &Simple) -> bool {
         let t = w.text();
         t == "TCAS_ALLOW" || t.starts_with("TCAS_ALLOW=")
     })
+}
+
+/// A command run by `eval` or `sh -c` whose program is computed (`eval "$x"`,
+/// `bash -c "$CMD"`): it may be git (harness.md section 5.1, "识别不了的时候").
+pub fn dynamic_script(s: &Simple) -> bool {
+    s.words.first().is_some_and(Word::is_dynamic)
+        && s.wrapped_by.iter().any(|w| w == "eval" || w.ends_with(" -c"))
 }
 
 /// harness.md 5.5: the whole command is one plain `tcas` command. Returns its arguments.
@@ -819,8 +883,9 @@ mod tests {
         assert_eq!(one("git add -- a.ts"), Action::AddPaths(sv(&["a.ts"])));
         assert_eq!(one("git add -N a.ts"), Action::AddPaths(sv(&["a.ts"])));
         assert_eq!(one("git add src"), Action::AddPaths(sv(&["src"])));
-        assert_eq!(one("git add ./"), Action::AddPaths(sv(&["./"])));
-        assert_eq!(one("git add -p"), Action::AddPaths(vec![]));
+        assert_eq!(one("git add ./"), Action::AddAll);
+        assert_eq!(one("git add -p"), Action::AddAll);
+        assert_eq!(one("git add -p a.ts"), Action::AddPaths(sv(&["a.ts"])));
         assert_eq!(one("git add --pathspec-from-file=x"), Action::Dynamic);
         assert_eq!(one("git add a $f"), Action::Dynamic);
     }
@@ -939,7 +1004,7 @@ mod tests {
             one("git checkout HEAD -- a"),
             Action::RestorePaths(sv(&["a"]))
         );
-        assert_eq!(one("git checkout HEAD a"), Action::RestorePaths(sv(&["a"])));
+        assert_eq!(one("git checkout HEAD a"), Action::CheckoutPaths { first: s("HEAD"), paths: sv(&["a"]) });
         assert_eq!(one("git restore a"), Action::RestorePaths(sv(&["a"])));
         assert_eq!(
             one("git restore -s HEAD~1 a"),
@@ -1307,5 +1372,92 @@ mod tests {
             calls("bash -c \"git stash"),
             vec![(s("/w"), Action::StashSave)]
         );
+    }
+
+    // ---- forms found in the audit of 2026-11-25 ----
+
+    #[test]
+    fn computed_scripts_are_dynamic() {
+        for cmd in [r#"eval "$x""#, r#"bash -c "$CMD""#, r#"sh -c "$(cat script)""#] {
+            let p = parse(cmd, "/w", Some(HOME));
+            assert!(p.commands.iter().any(dynamic_script), "{cmd}: {p:?}");
+        }
+        for cmd in [r#"bash -c "echo $HOME""#, "$EDITOR a.txt", r#"eval "echo $x""#] {
+            let p = parse(cmd, "/w", Some(HOME));
+            assert!(!p.commands.iter().any(dynamic_script), "{cmd}: {p:?}");
+        }
+        assert_eq!(calls(r#"bash -c "cd api && echo $X && git stash""#), vec![(s("/w/api"), Action::StashSave)]);
+        assert_eq!(one(r#"sh -c "git $SUB""#), Action::Dynamic);
+    }
+
+    #[test]
+    fn checkout_with_several_paths_keeps_the_first() {
+        assert_eq!(
+            one("git checkout other.rs mine.rs"),
+            Action::CheckoutPaths { first: s("other.rs"), paths: sv(&["mine.rs"]) }
+        );
+        assert_eq!(
+            one("git checkout main src/a.ts src/b.ts"),
+            Action::CheckoutPaths { first: s("main"), paths: sv(&["src/a.ts", "src/b.ts"]) }
+        );
+        assert_eq!(one("git checkout $REF a.ts"), Action::Dynamic);
+        assert_eq!(one("git checkout main $F"), Action::Dynamic);
+    }
+
+    #[test]
+    fn wrappers_that_change_directory() {
+        assert_eq!(calls("env -C api git stash"), vec![(s("/w/api"), Action::StashSave)]);
+        assert_eq!(calls("sudo --chdir=api git reset --hard"), vec![(s("/w/api"), Action::ResetHard)]);
+        assert_eq!(calls(r#"env -S "git -C api stash""#), vec![(s("/w/api"), Action::StashSave)]);
+        assert_eq!(calls("bash -c -- 'cd api && git stash'"), vec![(s("/w/api"), Action::StashSave)]);
+    }
+
+    #[test]
+    fn computed_option_values_are_not_paths() {
+        assert_eq!(one(r#"git commit --message="$MSG" -- mine.rs"#), Action::CommitPaths(sv(&["mine.rs"])));
+        assert_eq!(one(r#"git commit -m"$MSG" -- mine.rs"#), Action::CommitPaths(sv(&["mine.rs"])));
+        assert_eq!(one(r#"git commit --author="$A" -m x"#), Action::CommitStaged { amend: false });
+        assert_eq!(one(r#"git commit --pathspec-from-file="$F""#), Action::Dynamic);
+        assert_eq!(one("git commit -- $F"), Action::Dynamic);
+    }
+
+    #[test]
+    fn patch_and_include_modes() {
+        assert_eq!(one("git checkout -p"), Action::RestorePaths(sv(&["."])));
+        assert_eq!(one("git restore --patch"), Action::RestorePaths(sv(&["."])));
+        assert_eq!(one("git restore -p a.ts"), Action::RestorePaths(sv(&["a.ts"])));
+        assert_eq!(one("git commit -i mine.rs -m x"), Action::CommitStaged { amend: false });
+        assert_eq!(one("git commit --include mine.rs -m x"), Action::CommitStaged { amend: false });
+        assert_eq!(one("git commit -o mine.rs -m x"), Action::CommitPaths(sv(&["mine.rs"])));
+    }
+
+    #[test]
+    fn whole_tree_pathspecs_add_everything() {
+        for p in [".", "./", ":/", ":(top)", ":/.", ":(top).", ":(top)./"] {
+            assert_eq!(one(&format!("git add '{p}'")), Action::AddAll, "{p}");
+        }
+        assert_eq!(one("git add ./src"), Action::AddPaths(sv(&["./src"])));
+    }
+
+    #[test]
+    fn computed_alias_in_config_is_dynamic() {
+        let p = parse("git -c alias.st=$X st", "/w", None);
+        let c = git_call(&p.commands[0]).unwrap();
+        assert!(!c.dir_known);
+        let p = parse(r#"git -c user.name="$N" commit -m x -- a.ts"#, "/w", None);
+        let c = git_call(&p.commands[0]).unwrap();
+        assert!(c.dir_known);
+        assert_eq!(classify(&c), Action::CommitPaths(sv(&["a.ts"])));
+    }
+
+    #[test]
+    fn work_dir_follows_work_tree_and_git_dir() {
+        let wd = |cmd: &str| git_call(&parse(cmd, "/w", None).commands[0]).unwrap().work_dir();
+        assert_eq!(wd("git stash"), "/w");
+        assert_eq!(wd("git --work-tree=api stash"), "/w/api");
+        assert_eq!(wd("git --git-dir=api/.git stash"), "/w/api");
+        assert_eq!(wd("git --git-dir /r/app/.git --work-tree /r/app stash"), "/r/app");
+        assert_eq!(wd("git -C api --git-dir=.git stash"), "/w/api");
+        assert_eq!(wd("git --git-dir=/srv/bare.git log"), "/srv/bare.git");
     }
 }

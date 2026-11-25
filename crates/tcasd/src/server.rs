@@ -34,10 +34,20 @@ pub fn scrub_env() {
 
 fn lock(home: &Home) -> std::io::Result<Option<File>> {
     let f = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(home.pid_file())?;
-    // SAFETY: a valid descriptor owned by `f`.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if r != 0 {
-        return Ok(None);
+    // A client checking whether a tcasd is starting holds the lock for an
+    // instant; only a lock held for a while means another tcasd.
+    let mut tries = 0;
+    loop {
+        // SAFETY: a valid descriptor owned by `f`.
+        let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if r == 0 {
+            break;
+        }
+        tries += 1;
+        if tries >= 10 {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     f.set_len(0)?;
     (&f).write_all(format!("{}\n", std::process::id()).as_bytes())?;
@@ -55,14 +65,16 @@ fn rotate_log(home: &Home) {
 pub fn run(home: Home) -> Result<(), String> {
     scrub_env();
     home.ensure().map_err(|e| format!("{}: {e}", home.dir.display()))?;
-    rotate_log(&home);
     let Some(lock_file) = lock(&home).map_err(|e| format!("{}: {e}", home.pid_file().display()))? else {
         return Err("another tcasd is already running".into());
     };
+    // Only the tcasd holding the lock touches the log and the socket.
+    rotate_log(&home);
     let sock = home.socket();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).map_err(|e| format!("{}: {e}", sock.display()))?;
-    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", sock.display()))?;
     let conn = store::open(&home.db()).map_err(|e| format!("{}: {e}", home.db().display()))?;
 
     let d: &'static Daemon = Box::leak(Box::new(Daemon {

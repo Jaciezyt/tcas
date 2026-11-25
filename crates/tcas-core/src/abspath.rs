@@ -17,12 +17,10 @@ pub fn contains(outer: &str, inner: &str, case_insensitive: bool) -> bool {
 /// `inner` relative to `outer` ("" when equal), keeping `inner`'s spelling.
 /// `outer` must contain `inner`.
 pub fn relative(outer: &str, inner: &str) -> String {
-    let o = outer.trim_end_matches('/');
-    if inner.len() <= o.len() {
-        String::new()
-    } else {
-        inner[o.len() + 1..].trim_end_matches('/').to_string()
-    }
+    // By components, not bytes: `outer` may contain `inner` only with the
+    // case folded, which can change a path's length.
+    let n = outer.trim_end_matches('/').split('/').count();
+    inner.splitn(n + 1, '/').nth(n).unwrap_or("").trim_end_matches('/').to_string()
 }
 
 #[cfg(test)]
@@ -44,5 +42,14 @@ mod tests {
         assert_eq!(relative("/a/b", "/a/b/c/d.ts"), "c/d.ts");
         assert_eq!(relative("/a/b", "/a/b"), "");
         assert_eq!(relative("/a/B", "/a/b/X"), "X");
+    }
+
+    #[test]
+    fn relative_goes_by_components() {
+        assert_eq!(relative("/a/b", "/a/b/c/d"), "c/d");
+        assert_eq!(relative("/a/b/", "/a/b"), "");
+        assert_eq!(relative("/", "/x/y"), "x/y");
+        assert!(contains("/W/İ", "/w/İ/x", true));
+        assert_eq!(relative("/W/İ", "/w/İ/x"), "x");
     }
 }

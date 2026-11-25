@@ -55,11 +55,11 @@ pub fn tilde(abs: &Path, home: Option<&Path>) -> String {
 pub fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./~:@%+=,".contains(c));
-    if plain && !s.starts_with('~') {
+    if plain {
         s.to_string()
-    } else if plain {
+    } else if let Some(rest) = s.strip_prefix("~/") {
         // Keep a leading ~ unquoted so the shell expands it.
-        s.to_string()
+        format!("~/{}", shell_quote(rest))
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
@@ -93,6 +93,13 @@ mod tests {
     fn quoting() {
         assert_eq!(shell_quote("src/a.ts"), "src/a.ts");
         assert_eq!(shell_quote("my file"), "'my file'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn quoting_keeps_a_leading_tilde_expandable() {
+        assert_eq!(shell_quote("~/src/a.ts"), "~/src/a.ts");
+        assert_eq!(shell_quote("~/with space"), "~/'with space'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 }

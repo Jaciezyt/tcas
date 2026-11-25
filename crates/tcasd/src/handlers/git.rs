@@ -31,13 +31,18 @@ pub struct Co<'a> {
     pub ci: bool,
 }
 
-/// The checkout whose root is `abs`.
+/// The checkout whose root is `abs`: a known one, or one made since the
+/// last discovery (a worktree just added), found on disk the way edits find
+/// theirs (leases.md section 3, step 6).
 pub fn checkout_at<'a>(env: &'a Env, abs: &str) -> Option<Co<'a>> {
     let (ws, root) = env.world.root_of(abs)?;
     let rel = abspath::relative(&root.path, abs);
     let k = relpath::key(&rel, root.ci);
-    let r = ws.repos.iter().find(|r| r.root == root.name && relpath::key(&r.dir, root.ci) == k)?;
-    Some(Co { ws, root: root.name.clone(), dir: r.dir.clone(), abs: ws.repo_abs(&root.name, &r.dir), ci: root.ci })
+    let dir = match ws.repos.iter().find(|r| r.root == root.name && relpath::key(&r.dir, root.ci) == k) {
+        Some(r) => r.dir.clone(),
+        None => crate::repos::owning(&root.path, abs).filter(|d| relpath::key(d, root.ci) == k)?,
+    };
+    Some(Co { ws, root: root.name.clone(), abs: ws.repo_abs(&root.name, &dir), dir, ci: root.ci })
 }
 
 fn canonical(p: &str) -> String {
@@ -291,15 +296,18 @@ pub fn process_commit(env: &Env, ws: &Ws, root: &str, dir: &str, hash: &str, pat
             } else {
                 committed(env, &l)?;
             }
-        } else if is_clean && left_behind(env, &l)? {
+        } else if is_clean && (left_behind(env, &l)? || l.stalled_at.is_some()) {
+            // Left behind or stalled, and now committed by someone else
+            // (harness.md section 5.6, post-commit).
             engine::release_with_commit(env, &l, "orphan_clean", by, Some(hash))?;
             released.push(ws.path_ref(&l.root, &l.path, false));
         }
     }
-    for k in &all_keys {
+    // Rows are stored by path as written (reconcile.rs), not by key.
+    for p in paths {
         env.c.execute(
             "DELETE FROM unattributed WHERE workspace=?1 AND root=?2 AND path=?3",
-            params![ws.row.id, root, k],
+            params![ws.row.id, root, relpath::join(dir, p)],
         )?;
     }
     let shown: Vec<String> = paths.iter().map(|p| ws.display(root, &relpath::join(dir, p), false)).collect();

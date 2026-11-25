@@ -46,17 +46,25 @@ impl Checkout<'_> {
     }
 }
 
-/// The checkout containing `dir`, among the workspace's known ones.
+/// The checkout containing `dir`: the deepest known one, or a deeper one
+/// made since the last discovery (a worktree just added), found on disk the
+/// way edits find theirs (leases.md section 3, step 6).
 fn checkout_of<'a>(env: &'a Env, dir: &str) -> Option<Checkout<'a>> {
     let (ws, root) = env.world.root_of(dir)?;
     let rel = abspath::relative(&root.path, dir);
     let key = relpath::key(&rel, root.ci);
-    let best = ws
+    let known = ws
         .repos
         .iter()
         .filter(|r| r.root == root.name && relpath::contains(&relpath::key(&r.dir, root.ci), &key))
-        .max_by_key(|r| r.dir.len())?;
-    Some(Checkout { ws, root: root.name.clone(), dir: best.dir.clone(), abs: ws.repo_abs(&root.name, &best.dir) })
+        .max_by_key(|r| r.dir.len())
+        .map(|r| r.dir.clone());
+    let on_disk = crate::repos::owning(&root.path, dir);
+    let best = match (known, on_disk) {
+        (Some(k), Some(d)) => if d.len() > k.len() { d } else { k },
+        (k, d) => k.or(d)?,
+    };
+    Some(Checkout { ws, root: root.name.clone(), abs: ws.repo_abs(&root.name, &best), dir: best })
 }
 
 /// Leases of other sessions in this checkout (not in checkouts nested in it).
@@ -148,6 +156,13 @@ fn path_list(env: &Env, co: &Checkout, ls: &[&LeaseRow]) -> String {
     out.join("\n")
 }
 
+/// A directory from the command line with its symlinks resolved, the way
+/// workspace roots are stored (leases.md section 3): `cd /tmp/ws` is
+/// `/private/tmp/ws` on macOS.
+pub fn real_dir(d: &str) -> String {
+    fsys::to_str(&fsys::normalize(Path::new(d)))
+}
+
 /// The guard for one Bash command (harness.md section 5.1). `None` lets it run.
 pub fn check(env: &Env, sid: &str, command: &str, cwd: &str) -> R<Option<Refusal>> {
     let home = tcas_sys::home::user_home().map(|h| fsys::to_str(&h));
@@ -157,6 +172,26 @@ pub fn check(env: &Env, sid: &str, command: &str, cwd: &str) -> R<Option<Refusal
     }
     let on = |dir: &str| checkout_of(env, dir).is_none_or(|c| c.ws.cfg.bash.git_guard);
     for s in &parsed.commands {
+        // `eval "$x"`, `sh -c "$CMD"`: it may be git, and nothing about it can
+        // be checked (harness.md section 5.1, "识别不了的时候").
+        if guard::dynamic_script(s) {
+            let dir = real_dir(&s.dir);
+            if on(&dir)
+                && let Some(co) = checkout_of(env, &dir)
+            {
+                let others = others_in(env, &co, sid)?;
+                if !others.is_empty() {
+                    return Ok(Some(refuse(
+                        "dynamic",
+                        &co,
+                        &others,
+                        "A command run by eval or sh -c whose text is computed",
+                        "Write it out explicitly (no variables, $(…), xargs or eval), so it can be checked.",
+                    )));
+                }
+            }
+            continue;
+        }
         if guard::sets_tcas_allow(s) {
             let co = checkout_of(env, &s.dir);
             return Ok(Some(Refusal {
@@ -168,8 +203,9 @@ pub fn check(env: &Env, sid: &str, command: &str, cwd: &str) -> R<Option<Refusal
                 repo: co.as_ref().map(Checkout::shown),
             }));
         }
-        let Some(call) = guard::git_call(s) else { continue };
-        if !on(&call.dir) {
+        let Some(mut call) = guard::git_call(s) else { continue };
+        call.dir = real_dir(&call.dir);
+        if !on(&call.work_dir()) {
             continue;
         }
         if let Some(r) = check_git(env, sid, &call)? {
@@ -193,8 +229,8 @@ fn protected(env: &Env, p: &Parsed) -> Option<Refusal> {
             if w.is_empty() || w.starts_with('-') && !w.contains('/') {
                 continue;
             }
-            let abs = shell::join_dir(&s.dir, w);
-            if homes.iter().any(|h| abspath::contains(h, &abs, false)) {
+            let abs = real_dir(&shell::join_dir(&s.dir, w));
+            if homes.iter().any(|h| abspath::contains(h, &abs, fsys::case_insensitive(home))) {
                 let v = Viewer::new(&env.cwd, env.now);
                 return Some(Refusal {
                     rule: "config",
@@ -227,13 +263,13 @@ const TELL_USER: &str = "If it needs doing, tell the user.";
 fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
     // The checkout it acts on. `--git-dir`/`--work-tree` written out name it;
     // a computed one is a dynamic command.
-    let dir = call.work_tree.as_deref().map(|w| shell::join_dir(&call.dir, w)).unwrap_or_else(|| call.dir.clone());
+    let dir = real_dir(&call.work_dir());
     let Some(co) = checkout_of(env, &dir) else { return Ok(None) };
     let others = others_in(env, &co, sid)?;
     if others.is_empty() {
         // Worktree removal is judged by its target, which may be elsewhere.
         if let Action::WorktreeRemove(t) | Action::WorktreeMove(t) = guard::classify(call) {
-            return worktree_target(env, sid, &co, &t, call);
+            return worktree_target(env, sid, &t, call);
         }
         return Ok(None);
     }
@@ -364,6 +400,16 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
                 "Switching branches",
                 &format!("It changes the files they are working on. {TELL_USER}"),
             )),
+            Action::CheckoutPaths { first, paths } => {
+                // `git checkout <tree-ish> <paths>`, or every word a path.
+                let mut args = vec![tcas_core::shell::Word::Lit("--".into())];
+                if !env.d.git.is_commit(&co.abs, &first) {
+                    args.push(tcas_core::shell::Word::Lit(first));
+                }
+                args.extend(paths.into_iter().map(tcas_core::shell::Word::Lit));
+                call.args = args;
+                continue;
+            }
             Action::CheckoutName(n) => {
                 if env.d.git.is_commit(&co.abs, &n) {
                     Some(refuse(
@@ -385,7 +431,7 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
                 &format!("git {sub}"),
                 &format!("It rewrites files they are working on. {TELL_USER}"),
             )),
-            Action::WorktreeRemove(t) | Action::WorktreeMove(t) => return worktree_target(env, sid, &co, &t, &call),
+            Action::WorktreeRemove(t) | Action::WorktreeMove(t) => return worktree_target(env, sid, &t, &call),
             Action::Submodule(k) => Some(refuse(
                 "submodule",
                 &co,
@@ -429,13 +475,14 @@ fn check_git(env: &Env, sid: &str, call: &GitCall) -> R<Option<Refusal>> {
 
 /// `git worktree remove/move <dir>`: refused when the target checkout holds
 /// other sessions' leases, wherever the command runs from.
-fn worktree_target(env: &Env, sid: &str, from: &Checkout, target: &str, call: &GitCall) -> R<Option<Refusal>> {
+fn worktree_target(env: &Env, sid: &str, target: &str, call: &GitCall) -> R<Option<Refusal>> {
     let abs = shell::join_dir(&call.dir, target);
     let abs = std::fs::canonicalize(&abs).map(|p| fsys::to_str(&p)).unwrap_or(abs);
     let Some(co) = checkout_of(env, &abs) else { return Ok(None) };
     let ci = co.ws.ci(&co.root);
     let target = fsys::to_str(&co.abs);
-    if !(abspath::contains(&target, &abs, ci) && abspath::contains(&abs, &target, ci)) || co.abs == from.abs {
+    // Judged by the target, even when it is the checkout the command runs in.
+    if !(abspath::contains(&target, &abs, ci) && abspath::contains(&abs, &target, ci)) {
         return Ok(None);
     }
     let others = others_in(env, &co, sid)?;

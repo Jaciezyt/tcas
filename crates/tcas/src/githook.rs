@@ -61,6 +61,9 @@ pub fn run(name: &str, args: &[String]) -> i32 {
         "post-rewrite" => {
             let _ = stdin_text();
         }
+        // `post-checkout` reports a branch switch (third argument 1), not a
+        // file restore (harness.md section 5.6).
+        "post-checkout" if args.get(2).map(String::as_str) != Some("1") => return 0,
         "pre-commit" | "post-commit" | "pre-rebase" | "post-checkout" | "post-merge" => {}
         _ => return 0,
     }
@@ -74,7 +77,7 @@ pub fn run(name: &str, args: &[String]) -> i32 {
     }
 
     let mut a = GitHookArgs { hook: hook.clone(), repo: cwd_s.clone(), args: args.to_vec(), ..GitHookArgs::default() };
-    a.allow = std::env::var_os("TCAS_ALLOW").is_some_and(|v| !v.is_empty());
+    a.allow = std::env::var("TCAS_ALLOW").is_ok_and(|v| !v.is_empty() && v != "0");
     match hook.as_str() {
         "pre-commit" => {
             let Some(out) = git(&["diff", "--cached", "--name-only", "-z", "--no-renames"]) else { return 0 };

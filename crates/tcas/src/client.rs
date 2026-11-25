@@ -2,6 +2,7 @@
 //! (daemon-and-cli.md section 2).
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -91,12 +92,24 @@ impl Client {
         Ok(())
     }
 
+    /// A tcasd holds the lock on `tcasd.pid`: it is running or starting.
+    fn locked(&self) -> bool {
+        let Ok(f) = std::fs::File::open(self.home.pid_file()) else { return false };
+        // SAFETY: a valid descriptor owned by `f`; the lock goes with it.
+        let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        r != 0
+    }
+
     /// A connection, starting tcasd if needed and waiting up to `wait`.
+    /// When another tcasd holds the lock it is starting: wait for its socket
+    /// instead of starting one more (daemon-and-cli.md section 2).
     pub fn ensure(&self, wait: Duration) -> Result<UnixStream, String> {
         if let Ok(s) = self.connect() {
             return Ok(s);
         }
-        self.spawn_daemon()?;
+        if !self.locked() {
+            self.spawn_daemon()?;
+        }
         let deadline = Instant::now() + wait;
         loop {
             if let Ok(s) = self.connect() {
