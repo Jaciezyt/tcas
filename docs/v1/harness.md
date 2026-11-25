@@ -47,7 +47,7 @@ plugins/claude/
 - **环境变量之外，再用祖先进程认一次。** `tcas` 把自己的各级祖先进程（PID 和启动时间）报给 tcasd，其中有登记过的会话进程，就按那个会话处理。所以 agent 清掉这两个变量再运行 `tcas`，仍然会被认出来，用不了只给用户的命令（[daemon-and-cli.md](daemon-and-cli.md) 第 5 节）。
   - 实测（第 8 节）：Bash 工具运行的命令，直接运行、清掉变量、套一层 `bash -c`、后台运行时，祖先里都有 harness 进程。
   - 脱离出去的进程（父进程已经退出）祖先链会断，这时环境变量还在，照样认得出。
-  - 两样同时去掉才会被当成用户。第一版不防这个（design.md 第 3.7 节的威胁模型：防顺手越权，不防蓄意绕过）。
+  - 两样同时去掉才会被当成用户。第一版不防这个（atc 设计文档第 3.7 节的威胁模型：防顺手越权，不防蓄意绕过）。
   - 还没有登记过的会话（它的目录不在任何 workspace 里，hook 没有联系过 tcasd）只能靠环境变量认。
 
 **进程**：hook 进程的父进程就是 harness 进程（实测；转发脚本用 `exec`，所以中间不多一层），`tcas hook` 每次把它的 PID 和启动时间报给 tcasd，用来判断会话是否还活着。
@@ -654,7 +654,7 @@ Codex 的部分都没有运行验证过。已知的（本机 codex-cli 0.166.0�
 
 - 功能开关里 `hooks` 和 `plugins` 是稳定并开启的；`plugin_hooks` 这个开关显示为已移除，plugin 能不能带 hook 没有确认。
 - 程序里有 `PreToolUse`、`PostToolUse`、`SessionStart`、`UserPromptSubmit`、`PermissionRequest` 这些 hook 事件，有 `hooks/hooks.json` 和 `.codex-plugin` 的字样，有环境变量名 `CODEX_THREAD_ID`、`CODEX_SESSION_ID`。
-- design.md 第 10.1 节：编辑走 `apply_patch`，hook 收到补丁全文，路径要自己解析；项目级 hook 要先建立信任。
+- atc 设计文档第 10.1 节：编辑走 `apply_patch`，hook 收到补丁全文，路径要自己解析；项目级 hook 要先建立信任。
 
 适配要做的事：
 
@@ -668,7 +668,7 @@ Codex 的部分都没有运行验证过。已知的（本机 codex-cli 0.166.0�
 
 开工前先用同一套探针确认：hook 输入的字段、拒绝的输出格式、hook 出错时的行为、环境变量是否进入 shell 命令、有没有会话结束事件、子 agent 的调用是否带得出身份、有没有后台运行命令的方式以及命令结束时会话是否被唤醒（没有的话不提供等待，见第 6 节）。
 
-Codex 的沙箱能把 Bash 的写权限收窄到指定路径（design.md 第 10.4 节实测）。第一版不用它，因为会话是用户自己启动的，可写路径在启动时就定了。
+Codex 的沙箱能把 Bash 的写权限收窄到指定路径（atc 设计文档第 10.4 节实测）。第一版不用它，因为会话是用户自己启动的，可写路径在启动时就定了。
 
 ## 12. 给 agent 的说明
 

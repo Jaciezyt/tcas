@@ -5,8 +5,11 @@ members = ["crates/tcas-core", "crates/tcas-sys", "crates/tcasd", "crates/tcas"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "MIT"
 publish = false
+rust-version = "1.88"
+description = "Collision avoidance for coding agents that share a checkout"
+homepage = "https://tcas.io"
 
 [workspace.dependencies]
 tcas-core = { path = "crates/tcas-core" }
