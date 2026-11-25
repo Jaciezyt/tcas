@@ -244,7 +244,7 @@ opened ~/Code/app (mode auto), 3 repositories:
   workspace "app" now has 3 roots. Paths are shown as app/…, app-backend/…, app-website/…
   ```
 
-  也可以写在主目录的 `.tcas.toml` 里（第 6 节的 `roots`），打开时自动加进来。
+  也可以写在主目录的 `.tcas.toml` 里（第 6 节的 `roots`），打开时自动加进来。当前目录已经在某个打开的 workspace 里时，harness 附带的额外工作区目录（AGY 的 `workspacePaths` / `--add-dir` / `/add-dir`、Claude Code 的 `--add-dir` / `/add-dir` `DirectoryAdded` 及项目 `.claude/settings*.json` 的 `permissions.additionalDirectories`）也会在 hook 触发时自动作为持久化根并入该 workspace（豁免目录、已在其他 workspace 中的目录和超过 `open_max_checkouts` 的大目录自动跳过）。
 
 - **仓库在 workspace 外面还有 worktree 时**，`open` 把它们列出来并给出加进来的命令，不替你加。那里的会话在加进来之前不受管理：
 

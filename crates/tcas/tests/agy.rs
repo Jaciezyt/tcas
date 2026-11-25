@@ -667,3 +667,101 @@ fn builtin_gemini_exempt_and_tcas_disable() {
     let post = agy.hook_env(json!({ "hookEventName": "PostToolUse" }), &[("TCAS_DISABLE", "1")]);
     assert!(post.is_empty_obj());
 }
+
+#[test]
+fn harness_workspace_dirs_auto_added_to_open_workspace() {
+    let t = T::new();
+    let app = t.repo("app", &[("a.txt", "a\n")]);
+    let fkit = t.repo("frontend-kit", &[("Tabs.vue", "<template>old</template>\n")]);
+    let backend = t.repo("backend", &[("sub/api.py", "x = 1\n")]);
+    let passkey = t.repo("passkey", &[("auth.ts", "export const k = 1;\n")]);
+    let core_repo = t.repo("core", &[("lib.rs", "pub fn c() {}\n")]);
+    let separate = t.repo("separate-ws", &[("s.txt", "s\n")]);
+    let exempt_dir = t.repo("exempt-repo", &[("e.txt", "e\n")]);
+
+    t.ok(None, &["exempt", "add", &exempt_dir.to_string_lossy()]);
+
+    // 1. Before `app` is opened, AGY `workspacePaths` does NOT auto-open any workspace.
+    let pre_open_agy = AgyS::at(&t, "00001111-pre", &app);
+    let r0 = pre_open_agy.hook(json!({
+        "hookEventName": "SessionStart",
+        "workspacePaths": [app, fkit],
+        "lastUserInput": "survey"
+    }));
+    assert!(r0.is_empty_obj());
+    let ws_before = t.ok(None, &["--json", "workspace", "list"]).json();
+    assert_eq!(ws_before.as_array().unwrap().len(), 0);
+
+    // 2. Open `app` and `separate-ws` as two distinct workspaces.
+    t.ok(None, &["workspace", "open", &app.to_string_lossy()]);
+    t.ok(None, &["workspace", "open", &separate.to_string_lossy()]);
+
+    // 3. AGY Session A starts in `app` with `workspacePaths` containing `fkit`,
+    //    `separate` (already another workspace), and `exempt_dir` (exempt).
+    //    Only `fkit` is added as a persistent root of `app`!
+    let a = AgyS::at(&t, "aaaa2222-3333", &app);
+    let start = a.hook(json!({
+        "hookEventName": "SessionStart",
+        "workspacePaths": [app, fkit, separate, exempt_dir],
+        "lastUserInput": "fix tabs"
+    }));
+    let intro = start.context();
+    assert!(intro.contains("frontend-kit"), "intro should list auto-added root: {intro}");
+
+    let ws_list = t.ok(None, &["--json", "workspace", "list"]).json();
+    let app_ws = ws_list.as_array().unwrap().iter().find(|w| w["name"] == "app").unwrap();
+    let root_names: Vec<&str> = app_ws["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert_eq!(root_names, vec!["app", "frontend-kit"], "unexpected roots: {app_ws}");
+
+    // 4. AGY Session A edits `frontend-kit/Tabs.vue` -> acquires lease; Claude Session B
+    //    (started in `app` WITHOUT `--add-dir`) is denied on `frontend-kit/Tabs.vue`!
+    assert!(!a.write(&fkit.join("Tabs.vue"), "<template>new</template>\n").denied());
+
+    let b = S::at(&t, "bbbb4444-5555", &app);
+    b.start("startup");
+    let b_try = b.pre_edit(&fkit.join("Tabs.vue"));
+    assert!(b_try.denied(), "Claude session without /add-dir must still be coordinated on persisted root");
+
+    // Sessions cannot `workspace remove` a harness-added root (`added_by == "user"`).
+    assert_eq!(a.tcas(&["workspace", "remove", &fkit.to_string_lossy()]).code, 6);
+
+    // 5. Claude Session B runs `/add-dir ../backend/sub` (a subdirectory inside `backend` checkout):
+    //    `DirectoryAdded` normalizes to checkout root `backend` and adds it to `app`!
+    b.hook(json!({
+        "hook_event_name": "DirectoryAdded",
+        "directory": "../backend/sub",
+        "source": "slash_command"
+    }));
+    assert!(!b.edit(&backend.join("sub/api.py"), "x = 2\n").denied());
+    assert!(a.pre_edit(&backend.join("sub/api.py")).denied());
+
+    // 6. AGY mid-session `/add-dir ../passkey` arriving directly on `PreToolUse`
+    //    syncs the root AND acquires the lease in the same call!
+    let pre_pk = a.hook(json!({
+        "hookEventName": "PreToolUse",
+        "workspacePaths": [app, fkit, passkey],
+        "lastUserInput": "also update passkey",
+        "toolCall": { "id": "pk1", "name": "edit_file", "args": { "Path": passkey.join("auth.ts"), "Target": "1", "Replacement": "2" } }
+    }));
+    assert!(pre_pk.passthrough(), "expected allow/passthrough on newly attached passkey dir: {}", pre_pk.raw);
+    std::fs::write(passkey.join("auth.ts"), "export const k = 2;\n").unwrap();
+    assert!(b.pre_edit(&passkey.join("auth.ts")).denied());
+
+    // 7. Project `.claude/settings.local.json` `permissions.additionalDirectories` on Claude `SessionStart`
+    //    AND `--add-dir` CLI arg parsing via `proc::args` (`sleep` doesn't carry `--add-dir`, so test settings + `added_dirs`):
+    std::fs::create_dir_all(app.join(".claude")).unwrap();
+    std::fs::write(
+        app.join(".claude/settings.local.json"),
+        serde_json::to_string(&json!({ "permissions": { "additionalDirectories": ["../core"] } })).unwrap(),
+    )
+    .unwrap();
+    let c = S::at(&t, "cccc6666-7777", &app);
+    c.start("startup");
+    assert!(!c.edit(&core_repo.join("lib.rs"), "pub fn c() { /* c */ }\n").denied());
+    assert!(a.pre_edit(&core_repo.join("lib.rs")).denied());
+}

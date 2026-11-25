@@ -46,9 +46,13 @@ pub fn handle(env: &mut Env, req: &Request) -> R<Value> {
         };
         daemon::seen(env.c, &env.d.home, &sid, &seen, env.now)?;
         env.caller = Caller::Session(sid.clone());
+        if h.agent.is_none() {
+            super::workspace::sync_harness_dirs(env, &h.workspace_dirs)?;
+        }
         match h.event.as_str() {
             "session_start" => session_start(env, &sid, &h)?,
             "prompt" => prompt(env, &sid, &h)?,
+            "dir_added" => HookResponse::default(),
             "pre_tool" => pre_tool(env, &sid, &h)?,
             "post_tool" => post_tool(env, &sid, &h)?,
             "post_invocation" => post_invocation(env, &sid)?,

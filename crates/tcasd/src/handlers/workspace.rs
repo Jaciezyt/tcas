@@ -535,6 +535,7 @@ pub fn add(env: &mut Env, req: &Request) -> R<Value> {
             "workspace.root_added",
             json!({ "root": rname, "path": fsys::to_str(d), "by": env.caller.label() }),
         )?;
+        clear_outside_edits(env.c, &ws.row.id, &fsys::to_str(d), ci)?;
         env.reload()?;
         store_repos(env, &ws.row.id, &rname, &found.found, true)?;
         outside.extend(found.outside);
@@ -550,6 +551,105 @@ pub fn add(env: &mut Env, req: &Request) -> R<Value> {
         notes: vec![],
     };
     Ok(serde_json::to_value(res).unwrap())
+}
+
+fn clear_outside_edits(c: &rusqlite::Connection, ws_id: &str, root_path: &str, ci: bool) -> R<()> {
+    let paths: Vec<String> = {
+        let mut st = c.prepare("SELECT DISTINCT path FROM outside_edit WHERE workspace=?1")?;
+        let rows = st.query_map([ws_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for p in paths {
+        if abspath::contains(root_path, &p, ci) {
+            c.execute("DELETE FROM outside_edit WHERE workspace=?1 AND path=?2", params![ws_id, p])?;
+        }
+    }
+    Ok(())
+}
+
+/// Automatically attaches extra harness workspace directories (`--add-dir`,
+/// `/add-dir`, IDE multi-root `workspacePaths`) as persistent roots when the
+/// session's primary `cwd` already belongs to an open workspace. Invalid,
+/// exempt, nested, or conflicting directories are silently skipped so hooks
+/// never fail.
+pub fn sync_harness_dirs(env: &mut Env, raw_dirs: &[String]) -> R<Vec<String>> {
+    if raw_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(mut ws) = env.world.by_cwd(&env.cwd).cloned() else {
+        return Ok(Vec::new());
+    };
+    let home = user_home().and_then(|h| std::fs::canonicalize(h).ok());
+    let mut to_add: Vec<PathBuf> = Vec::new();
+    for raw in raw_dirs {
+        let p = fsys::absolute(&env.cwd, Path::new(raw));
+        let Ok(mut d) = fsys::canonical_dir(&p) else { continue };
+        if let Some(top) = env.d.git.toplevel(&d) {
+            d = top;
+        }
+        if d == Path::new("/") || Some(&d) == home.as_ref() {
+            continue;
+        }
+        let s = fsys::to_str(&d);
+        if ws.roots.iter().any(|r| abspath::contains(&r.path, &s, r.ci)) {
+            continue;
+        }
+        if exempt::find(&ws.exempt, &s).is_some() {
+            continue;
+        }
+        let Ok(None) = check_root(env, &d, Some(&ws.row.id)) else { continue };
+        if to_add.iter().any(|x| x == &d || x.starts_with(&d) || d.starts_with(x)) {
+            continue;
+        }
+        to_add.push(d);
+    }
+    if to_add.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let extra_roots: Vec<(String, bool)> = to_add.iter().map(|d| (fsys::to_str(d), fsys::case_insensitive(d))).collect();
+    let mut names: Vec<String> = ws.roots.iter().map(|r| r.name.clone()).collect();
+    let mut next_ord = ws.roots.iter().map(|r| r.ord).max().unwrap_or(-1) + 1;
+    let mut added = Vec::new();
+    for d in to_add {
+        let s = fsys::to_str(&d);
+        let Ok(None) = check_root(env, &d, Some(&ws.row.id)) else { continue };
+        let ci = fsys::case_insensitive(&d);
+        let found = discover(env, &d, ci, ws.cfg.repos.scan_depth, &ws.exempt, &extra_roots);
+        if found.found.len() > env.g.cfg.agents.open_max_checkouts {
+            continue;
+        }
+        let rname = unique(&base_name(&d), &names);
+        names.push(rname.clone());
+        store::insert_root(
+            env.c,
+            &RootRow {
+                workspace: ws.row.id.clone(),
+                name: rname.clone(),
+                ord: next_ord,
+                path: s.clone(),
+                ci,
+                added_by: "user".into(),
+                added_at: env.now,
+            },
+        )?;
+        next_ord += 1;
+        env.event(
+            Some(&ws.row.id),
+            env.caller.session(),
+            "workspace.root_added",
+            json!({ "root": rname, "path": s, "by": "user", "via": "harness" }),
+        )?;
+        clear_outside_edits(env.c, &ws.row.id, &s, ci)?;
+        env.reload()?;
+        store_repos(env, &ws.row.id, &rname, &found.found, true)?;
+        env.reload()?;
+        if let Some(w) = env.world.ws(&ws.row.id).cloned() {
+            ws = w;
+        }
+        added.push(rname);
+    }
+    Ok(added)
 }
 
 pub fn remove_root(env: &Env, ws: &Ws, r: &RootRow, reason: &str) -> R<()> {

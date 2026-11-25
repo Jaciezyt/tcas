@@ -445,7 +445,7 @@ pub struct HookTool {
 #[serde(rename_all = "camelCase")]
 pub struct HookRequest {
     pub harness: String,
-    /// `session_start`, `prompt`, `pre_tool`, `post_tool`, `post_invocation`, `stop`, `agent_stop`, `session_end`.
+    /// `session_start`, `prompt`, `dir_added`, `pre_tool`, `post_tool`, `post_invocation`, `stop`, `agent_stop`, `session_end`.
     pub event: String,
     /// The harness's own session ID; tcas's is `<harness>:<session>`.
     pub session: String,
@@ -479,6 +479,10 @@ pub struct HookRequest {
     /// of an existing live session in the same harness process.
     #[serde(default)]
     pub subagent_candidate: bool,
+    /// Workspace directories attached to this session by the harness
+    /// (`workspacePaths` in AGY, `--add-dir` / `/add-dir` in Claude Code).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_dirs: Vec<String>,
 }
 
 impl HookRequest {

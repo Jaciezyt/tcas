@@ -21,6 +21,7 @@ fn configured_timeout(event: &str, tool: &str) -> u64 {
     match (event, tool) {
         ("SessionStart", _) => 5,
         ("UserPromptSubmit", _) => 3,
+        ("DirectoryAdded", _) => 5,
         ("PreToolUse", "Bash") => 10,
         ("PreToolUse", _) => 8,
         ("PostToolUse", "Bash") => 10,
@@ -119,10 +120,22 @@ pub fn run(input: &str) -> i32 {
             if !(known || clear) {
                 return 0;
             }
-            let h = HookRequest { event: "session_start".into(), source, ..base };
+            let workspace_dirs = startup_workspace_dirs(&v, pid, &cwd);
+            let h = HookRequest { event: "session_start".into(), source, workspace_dirs, ..base };
             if let Ok(r) = contact(&local, &h, deadline) {
                 context("SessionStart", r.context);
             }
+            0
+        }
+        "DirectoryAdded" => {
+            if !known {
+                return 0;
+            }
+            let Some(dir) = s(&v, "directory") else {
+                return 0;
+            };
+            let h = HookRequest { event: "dir_added".into(), workspace_dirs: vec![abs(&cwd, dir)], ..base };
+            let _ = contact(&local, &h, deadline);
             0
         }
         "UserPromptSubmit" => {
@@ -255,6 +268,77 @@ fn write_env(sid: &str) {
 fn edit_paths(v: &Value, cwd: &str) -> Vec<String> {
     let input = v.get("tool_input").cloned().unwrap_or(Value::Null);
     ["file_path", "notebook_path"].iter().filter_map(|k| s(&input, k)).map(|p| abs(cwd, p)).collect()
+}
+
+/// Extra directories attached at Claude Code launch via `--add-dir <dirs...>`
+/// or project `.claude/settings*.json` `permissions.additionalDirectories`
+/// (plus optional `workspace_dirs` / `added_dirs` in JSON for testing).
+fn startup_workspace_dirs(v: &Value, pid: i32, cwd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let expanded = if let Some(rest) = trimmed.strip_prefix("~/")
+            && let Some(home) = tcas_sys::home::user_home()
+        {
+            home.join(rest).to_string_lossy().into_owned()
+        } else {
+            trimmed.to_string()
+        };
+        let resolved = abs(cwd, &expanded);
+        if std::path::Path::new(&resolved).is_dir() && !out.contains(&resolved) {
+            out.push(resolved);
+        }
+    };
+
+    for key in ["added_dirs", "workspace_dirs"] {
+        if let Some(arr) = v.get(key).and_then(Value::as_array) {
+            for item in arr.iter().filter_map(Value::as_str) {
+                push(item);
+            }
+        }
+    }
+
+    // Parse `--add-dir <dirs...>` / `--add-dir=<dir>` from the harness process argv.
+    let argv = tcas_sys::proc::args(pid);
+    let mut i = 1;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if let Some(val) = arg.strip_prefix("--add-dir=") {
+            push(val);
+            i += 1;
+            continue;
+        }
+        if arg == "--add-dir" {
+            i += 1;
+            while i < argv.len() && !argv[i].starts_with('-') {
+                push(&argv[i]);
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    // Project-scoped `.claude/settings.json` and `.claude/settings.local.json`.
+    let cwd_path = std::path::Path::new(cwd);
+    for rel in [".claude/settings.json", ".claude/settings.local.json"] {
+        if let Ok(text) = std::fs::read_to_string(cwd_path.join(rel))
+            && let Ok(cfg) = serde_json::from_str::<Value>(&text)
+            && let Some(arr) = cfg.get("permissions").and_then(|p| p.get("additionalDirectories")).and_then(Value::as_array)
+        {
+            for item in arr.iter().filter_map(Value::as_str) {
+                push(item);
+            }
+        }
+    }
+
+    out
 }
 
 fn read_paths(v: &Value, cwd: &str) -> Vec<String> {

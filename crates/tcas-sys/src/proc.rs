@@ -81,6 +81,74 @@ pub fn ancestors() -> Vec<ProcId> {
     out
 }
 
+/// Command-line arguments (`argv`) of `pid`, or empty when unreadable.
+#[cfg(target_os = "macos")]
+pub fn args(pid: i32) -> Vec<String> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    // SAFETY: KERN_PROCARGS2 writes into `buf` up to `len` bytes.
+    unsafe {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut len: libc::size_t = 0;
+        if libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len < 4 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || len < 4
+        {
+            return Vec::new();
+        }
+        buf.truncate(len);
+        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if argc <= 0 {
+            return Vec::new();
+        }
+        let mut pos = 4;
+        // Skip executable path and NUL alignment bytes before argv[0].
+        while pos < buf.len() && buf[pos] != 0 {
+            pos += 1;
+        }
+        while pos < buf.len() && buf[pos] == 0 {
+            pos += 1;
+        }
+        let mut out = Vec::new();
+        for _ in 0..argc {
+            if pos >= buf.len() {
+                break;
+            }
+            let end = buf[pos..].iter().position(|&b| b == 0).map(|i| pos + i).unwrap_or(buf.len());
+            out.push(String::from_utf8_lossy(&buf[pos..end]).into_owned());
+            pos = end + 1;
+        }
+        out
+    }
+}
+
+/// Command-line arguments (`argv`) of `pid`, or empty when unreadable.
+#[cfg(target_os = "linux")]
+pub fn args(pid: i32) -> Vec<String> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    let Ok(mut buf) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return Vec::new() };
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    buf.split(|&b| b == 0).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +161,6 @@ mod tests {
         assert!(alive(me, i.started_at));
         assert!(!alive(me, i.started_at - 10_000));
         assert!(!ancestors().is_empty());
+        assert!(!args(me).is_empty());
     }
 }

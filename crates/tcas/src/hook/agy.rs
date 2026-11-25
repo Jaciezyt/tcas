@@ -179,6 +179,7 @@ pub fn run(input: &str) -> i32 {
         started + Duration::from_secs(configured_timeout(&event, &tool_name)).saturating_sub(Duration::from_secs(1));
     let local = Local::load();
     let (pid, pid_started_at) = harness_pid();
+    let workspace_dirs = workspace_paths(&v, &cwd);
     let base = HookRequest {
         harness: "agy".into(),
         event: String::new(),
@@ -187,6 +188,7 @@ pub fn run(input: &str) -> i32 {
         pid,
         pid_started_at,
         subagent_candidate,
+        workspace_dirs: workspace_dirs.clone(),
         ..HookRequest::default()
     };
     let known = local.marked(&sid) || local.managed(&cwd) || (subagent_candidate && any_agy_marked(&local));
@@ -236,7 +238,7 @@ pub fn run(input: &str) -> i32 {
                     return 0;
                 }
             }
-            if !paths.iter().any(|p| local.managed(p)) {
+            if !paths.iter().any(|p| local.managed(p) || in_extra_ws_dir(&local, &cwd, &workspace_dirs, p)) {
                 // 0-byte stdout passes through to AGY's own permission flow.
                 return 0;
             }
@@ -268,9 +270,10 @@ pub fn run(input: &str) -> i32 {
             let tool = match tool_name.as_str() {
                 t if EDIT_TOOLS.contains(&t) => {
                     let paths = edit_paths(&args, &cwd);
+                    let extra = paths.iter().any(|p| in_extra_ws_dir(&local, &cwd, &workspace_dirs, p));
                     let outside =
                         local.managed(&cwd) && paths.iter().any(|p| local.root_of(p).is_none() && !local.is_exempt(p));
-                    if !(known || paths.iter().any(|p| local.managed(p)) || outside) {
+                    if !(known || paths.iter().any(|p| local.managed(p)) || extra || outside) {
                         empty_json();
                         return 0;
                     }
@@ -305,7 +308,8 @@ pub fn run(input: &str) -> i32 {
                 }
                 t if READ_TOOLS.contains(&t) => {
                     let paths = read_paths(&args, &cwd);
-                    if !(known || paths.iter().any(|p| local.managed(p))) {
+                    let extra = paths.iter().any(|p| in_extra_ws_dir(&local, &cwd, &workspace_dirs, p));
+                    if !(known || paths.iter().any(|p| local.managed(p)) || extra) {
                         empty_json();
                         return 0;
                     }
@@ -359,6 +363,32 @@ fn edit_paths(args: &Value, cwd: &str) -> Vec<String> {
         .filter_map(|k| s(args, k))
         .map(|p| abs(cwd, p))
         .collect()
+}
+
+fn workspace_paths(v: &Value, cwd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(arr) = v.get("workspacePaths").and_then(Value::as_array) {
+        for raw in arr.iter().filter_map(Value::as_str) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let resolved = abs(cwd, trimmed);
+            if !out.contains(&resolved) {
+                out.push(resolved);
+            }
+        }
+    }
+    out
+}
+
+fn in_extra_ws_dir(local: &Local, cwd: &str, ws_dirs: &[String], path: &str) -> bool {
+    local.managed(cwd)
+        && ws_dirs.iter().any(|d| {
+            local.root_of(d).is_none()
+                && !local.is_exempt(d)
+                && tcas_core::abspath::contains(d, path, false)
+        })
 }
 
 fn read_paths(args: &Value, cwd: &str) -> Vec<String> {
@@ -430,7 +460,9 @@ fn pre_command(
     }
 
     let dirs = bash_dirs(cwd, &parsed);
-    let concerns = dirs.iter().any(|d| local.managed(d));
+    let concerns = dirs
+        .iter()
+        .any(|d| local.managed(d) || in_extra_ws_dir(local, cwd, &base.workspace_dirs, d));
     let known = local.marked(sid) || (base.subagent_candidate && any_agy_marked(local));
     if !(concerns || known) {
         return;
