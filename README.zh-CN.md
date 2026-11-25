@@ -6,8 +6,6 @@
 
 在同一个仓库里同时开几个 Claude Code 或 Antigravity CLI 会话，迟早会有两个会话改同一个文件，或者一个会话执行 `git add -A`、`git stash`、`git checkout .`，把另一个会话改到一半的东西一起带走。TCAS 解决这个问题：它保证每个文件**同一时刻只有一个会话在改**。一个会话去改别的会话正在改的文件时当场被拒，并被告知谁占着、对方在做什么；它可以在后台等这个文件空出来，同时去做别的事。
 
-名字取自航空：TCAS（空中防撞系统）是飞机上防止两机相撞的系统。
-
 ```
 tcas: src/auth/session.ts is leased by another session (claude:7958…, since 14:02).
   Their brief: "Fix the login redirect loop in src/auth"
@@ -29,18 +27,6 @@ To wait for it, run this as a background command (Bash tool, run_in_background):
 - **租约会自己让出**。干净文件上的租约会让给下一个来申请的会话；显式申请的租约 30 分钟没用到，或者持有者提交过、结束了这一轮，也会让出。有未提交改动的文件不会自动换手。
 - **贴合现有的用法**。一个或几个检出、装着多个仓库的目录、worktree、子模块、并排的多个目录都可以放进一个 workspace。被 git 排除的文件、临时目录和 harness 自己的目录不管。
 - **可度量**。租约的每次变化都有事件记录；`tcas stats` 给出争用、等待、越界，以及 agent 事先申请的比例。
-
-## 状态
-
-第一版（只做租约这一层）已经完成，支持 **Claude Code** 和 **Antigravity CLI（AGY）**，Codex 在计划中。
-
-| | |
-|---|---|
-| 平台 | macOS。Linux 能编译，没有测过。不支持 Windows |
-| Harness | Claude Code 2.1.295 以上；Antigravity CLI（在 1.5.16 上测过） |
-| Git | 较新的 git 都行。git 钩子需要配置式钩子（在 git 2.54 上测过）；不支持时只靠命令护栏和对账 |
-
-任务板、调度、隔离和验证不在 TCAS 里，属于姊妹项目 [**atc**](https://github.com/Jaciezyt/atc)（空中交通管制），还在设计阶段。
 
 ## 安装
 

@@ -6,8 +6,6 @@
 
 Run several Claude Code or Antigravity CLI sessions in the same repository and sooner or later two of them edit the same file, or one runs `git add -A`, `git stash` or `git checkout .` over the other's half-finished work. TCAS stops that. It gives every file **one writer at a time**: a session that tries to change a file another session is working on is refused on the spot, told who holds it and why, and can wait for it in the background while it gets on with something else.
 
-The name comes from aviation: TCAS (Traffic Collision Avoidance System) is the on-board system that keeps two aircraft from colliding.
-
 ```
 tcas: src/auth/session.ts is leased by another session (claude:7958…, since 14:02).
   Their brief: "Fix the login redirect loop in src/auth"
@@ -29,18 +27,6 @@ To wait for it, run this as a background command (Bash tool, run_in_background):
 - **Leases let go on their own.** A lease on a clean file gives way to the next session that asks; explicit leases yield after 30 minutes unused, or once their holder has committed and ended its turn. A file with uncommitted changes never changes hands by itself.
 - **Works with how you already work.** One checkout or several, repositories nested inside a folder, worktrees, submodules, sibling directories in one workspace. Git-ignored files, temporary directories and the harnesses' own directories are left alone.
 - **Measurable.** Every lease change is an event; `tcas stats` reports contention, waits, overreach and how often agents claimed files before editing them.
-
-## Status
-
-The first version (leases only) is complete for **Claude Code** and **Antigravity CLI (AGY)**. Codex support is planned.
-
-| | |
-|---|---|
-| Platforms | macOS. Linux builds but has not been tested. Windows is not supported. |
-| Harnesses | Claude Code 2.1.295 or later; Antigravity CLI (tested with 1.5.16) |
-| Git | Any recent git. Git hooks need config-based hooks (tested with git 2.54); without them TCAS relies on the command guard and reconciliation. |
-
-Task boards, scheduling, isolation and verification are not part of TCAS; they belong to its sibling project [**atc**](https://github.com/Jaciezyt/atc) (air traffic control), still at the design stage.
 
 ## Install
 
